@@ -1,0 +1,21 @@
+# Project-level runtime packages.
+# Install torch/torchvision through scripts/setup-lorat-env.ps1 so CUDA wheels can
+# be selected explicitly on NVIDIA machines.
+numpy
+opencv-contrib-python
+
+# LoRAT runtime dependencies mirrored here for GitHub users who want a normal
+# requirements file in addition to the official LoRAT requirements snapshot.
+matplotlib
+tqdm
+pyyaml
+wandb
+timm
+pillow
+tabulate
+fvcore
+exifread
+pyzmq
+safetensors
+psutil
+pyturbojpeg

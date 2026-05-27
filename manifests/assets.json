@@ -1,0 +1,325 @@
+{
+  "groups": {
+    "week1-core": [
+      "lorat-repo",
+      "trackeval-repo",
+      "lorat-base-224",
+      "lorat-base-378",
+      "lorat-large-224",
+      "lorat-large-378",
+      "lorat-giant-224",
+      "lorat-giant-378",
+      "papers-core"
+    ],
+    "week1-datasets-small": [
+      "dancetrack-val",
+      "mot17-labels",
+      "tao-labels"
+    ],
+    "lorat-models": [
+      "lorat-base-224",
+      "lorat-base-378",
+      "lorat-large-224",
+      "lorat-large-378",
+      "lorat-giant-224",
+      "lorat-giant-378"
+    ],
+    "dancetrack": [
+      "dancetrack-train1",
+      "dancetrack-train2",
+      "dancetrack-val",
+      "dancetrack-test1",
+      "dancetrack-test2"
+    ],
+    "mot17": [
+      "mot17-full",
+      "mot17-labels"
+    ],
+    "tao-ow": [
+      "tao-train-non-ava-hacs",
+      "tao-val-non-ava-hacs",
+      "tao-test-non-ava-hacs",
+      "tao-labels",
+      "tao-ava-hacs-manual"
+    ],
+    "papers-core": [
+      "paper-lorat",
+      "paper-lora",
+      "paper-dancetrack",
+      "paper-motchallenge-2015",
+      "paper-mot16",
+      "paper-tao",
+      "paper-open-world-tracking",
+      "paper-hota",
+      "paper-deepsort",
+      "paper-bytetrack"
+    ],
+    "papers-extended": [
+      "papers-core",
+      "paper-strongsort",
+      "paper-botsort",
+      "paper-dinov2",
+      "paper-vit",
+      "paper-grounding-dino",
+      "paper-sam",
+      "paper-ovtrack",
+      "paper-video-owlvit"
+    ]
+  },
+  "assets": {
+    "lorat-repo": {
+      "kind": "repository_zip",
+      "url": "https://github.com/LitingLin/LoRAT/archive/refs/heads/main.zip",
+      "path": "external/LoRAT-main.zip",
+      "extractTo": "external",
+      "source": "https://github.com/LitingLin/LoRAT"
+    },
+    "trackeval-repo": {
+      "kind": "repository_zip",
+      "url": "https://github.com/JonathonLuiten/TrackEval/archive/refs/heads/master.zip",
+      "path": "external/TrackEval-master.zip",
+      "extractTo": "external",
+      "source": "https://github.com/JonathonLuiten/TrackEval"
+    },
+    "lorat-base-224": {
+      "kind": "model",
+      "googleDriveFileId": "1e1YtuyRHXFSUoOBYt9r-e74xrjZ8MFev",
+      "path": "models/lorat/base.bin",
+      "modelSize": "ViT-B, 224px search",
+      "minBytes": 50000000,
+      "source": "https://drive.google.com/drive/folders/1FvViP0MCSiAu2FSrNjg7XEORn74yOBdD"
+    },
+    "lorat-base-378": {
+      "kind": "model",
+      "googleDriveFileId": "12P2unXkN-tZYYBx0sFy6EGiPd48d5zlE",
+      "path": "models/lorat/base-378.bin",
+      "modelSize": "ViT-B, 378px search",
+      "minBytes": 50000000,
+      "source": "https://drive.google.com/drive/folders/1FvViP0MCSiAu2FSrNjg7XEORn74yOBdD"
+    },
+    "lorat-large-224": {
+      "kind": "model",
+      "googleDriveFileId": "1joL2VmWxrIhkapj7HykoTLYKmLiBgXqm",
+      "path": "models/lorat/large.bin",
+      "modelSize": "ViT-L, 224px search",
+      "minBytes": 125000000,
+      "source": "https://drive.google.com/drive/folders/1FvViP0MCSiAu2FSrNjg7XEORn74yOBdD"
+    },
+    "lorat-large-378": {
+      "kind": "model",
+      "googleDriveFileId": "1HAxSkvMeQwS-rjRY-Va6GhLEKqqMSLA2",
+      "path": "models/lorat/large-378.bin",
+      "modelSize": "ViT-L, 378px search",
+      "minBytes": 125000000,
+      "source": "https://drive.google.com/drive/folders/1FvViP0MCSiAu2FSrNjg7XEORn74yOBdD"
+    },
+    "lorat-giant-224": {
+      "kind": "model",
+      "googleDriveFileId": "1UmHVpHMyZ4w6D4MWnZlI7vhGrx8bAfGP",
+      "path": "models/lorat/giant.bin",
+      "modelSize": "ViT-g, 224px search",
+      "minBytes": 310000000,
+      "source": "https://drive.google.com/drive/folders/1FvViP0MCSiAu2FSrNjg7XEORn74yOBdD"
+    },
+    "lorat-giant-378": {
+      "kind": "model",
+      "googleDriveFileId": "1nYrKT4EfvqkSxUMqcCCBimgIsfakk7YL",
+      "path": "models/lorat/giant-378.bin",
+      "modelSize": "ViT-g, 378px search",
+      "minBytes": 310000000,
+      "source": "https://drive.google.com/drive/folders/1FvViP0MCSiAu2FSrNjg7XEORn74yOBdD"
+    },
+    "dancetrack-train1": {
+      "kind": "dataset",
+      "url": "https://huggingface.co/datasets/noahcao/dancetrack/resolve/main/train1.zip?download=true",
+      "path": "data/raw/DanceTrack/train1.zip",
+      "extractTo": "data/DanceTrack",
+      "source": "https://huggingface.co/datasets/noahcao/dancetrack"
+    },
+    "dancetrack-train2": {
+      "kind": "dataset",
+      "url": "https://huggingface.co/datasets/noahcao/dancetrack/resolve/main/train2.zip?download=true",
+      "path": "data/raw/DanceTrack/train2.zip",
+      "extractTo": "data/DanceTrack",
+      "source": "https://huggingface.co/datasets/noahcao/dancetrack"
+    },
+    "dancetrack-val": {
+      "kind": "dataset",
+      "url": "https://huggingface.co/datasets/noahcao/dancetrack/resolve/main/val.zip?download=true",
+      "path": "data/raw/DanceTrack/val.zip",
+      "extractTo": "data/DanceTrack",
+      "source": "https://huggingface.co/datasets/noahcao/dancetrack"
+    },
+    "dancetrack-test1": {
+      "kind": "dataset",
+      "url": "https://huggingface.co/datasets/noahcao/dancetrack/resolve/main/test1.zip?download=true",
+      "path": "data/raw/DanceTrack/test1.zip",
+      "extractTo": "data/DanceTrack",
+      "source": "https://huggingface.co/datasets/noahcao/dancetrack"
+    },
+    "dancetrack-test2": {
+      "kind": "dataset",
+      "url": "https://huggingface.co/datasets/noahcao/dancetrack/resolve/main/test2.zip?download=true",
+      "path": "data/raw/DanceTrack/test2.zip",
+      "extractTo": "data/DanceTrack",
+      "source": "https://huggingface.co/datasets/noahcao/dancetrack"
+    },
+    "mot17-full": {
+      "kind": "dataset",
+      "url": "https://motchallenge.net/data/MOT17.zip",
+      "path": "data/raw/MOTChallenge/MOT17.zip",
+      "extractTo": "data/MOTChallenge",
+      "source": "https://motchallenge.net/data/MOT17/"
+    },
+    "mot17-labels": {
+      "kind": "labels",
+      "url": "https://motchallenge.net/data/MOT17Labels.zip",
+      "path": "data/raw/MOTChallenge/MOT17Labels.zip",
+      "extractTo": "data/MOTChallenge",
+      "source": "https://motchallenge.net/data/MOT17/"
+    },
+    "tao-train-non-ava-hacs": {
+      "kind": "dataset",
+      "url": "https://motchallenge.net/data/1-TAO_TRAIN.zip",
+      "path": "data/raw/TAO/1-TAO_TRAIN.zip",
+      "extractTo": "data/TAO",
+      "source": "https://github.com/TAO-Dataset/tao/blob/master/docs/download.md"
+    },
+    "tao-val-non-ava-hacs": {
+      "kind": "dataset",
+      "url": "https://motchallenge.net/data/2-TAO_VAL.zip",
+      "path": "data/raw/TAO/2-TAO_VAL.zip",
+      "extractTo": "data/TAO",
+      "source": "https://github.com/TAO-Dataset/tao/blob/master/docs/download.md"
+    },
+    "tao-test-non-ava-hacs": {
+      "kind": "dataset",
+      "url": "https://motchallenge.net/data/3-TAO_TEST.zip",
+      "path": "data/raw/TAO/3-TAO_TEST.zip",
+      "extractTo": "data/TAO",
+      "source": "https://github.com/TAO-Dataset/tao/blob/master/docs/download.md"
+    },
+    "tao-labels": {
+      "kind": "labels",
+      "url": "https://motchallenge.net/data/TAOLabels.zip",
+      "path": "data/raw/TAO/TAOLabels.zip",
+      "extractTo": "data/TAO",
+      "source": "https://github.com/TAO-Dataset/tao/blob/master/docs/download.md"
+    },
+    "tao-ava-hacs-manual": {
+      "kind": "manual_dataset_part",
+      "manual": true,
+      "path": "data/raw/TAO/manual-ava-hacs.txt",
+      "source": "https://motchallenge.net/tao_download.php",
+      "note": "The AVA/HACS portions of TAO require a MOTChallenge account and must be downloaded after accepting the dataset terms."
+    },
+    "paper-lorat": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2403.05231",
+      "path": "papers/lorat_tracking_meets_lora.pdf",
+      "source": "https://arxiv.org/abs/2403.05231"
+    },
+    "paper-lora": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2106.09685",
+      "path": "papers/lora_low_rank_adaptation.pdf",
+      "source": "https://arxiv.org/abs/2106.09685"
+    },
+    "paper-dancetrack": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2111.14690",
+      "path": "papers/dancetrack_multi_object_tracking_uniform_appearance_diverse_motion.pdf",
+      "source": "https://arxiv.org/abs/2111.14690"
+    },
+    "paper-motchallenge-2015": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/1504.01942",
+      "path": "papers/motchallenge_2015_benchmark.pdf",
+      "source": "https://arxiv.org/abs/1504.01942"
+    },
+    "paper-mot16": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/1603.00831",
+      "path": "papers/mot16_benchmark.pdf",
+      "source": "https://arxiv.org/abs/1603.00831"
+    },
+    "paper-tao": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2005.10356",
+      "path": "papers/tao_tracking_any_object.pdf",
+      "source": "https://arxiv.org/abs/2005.10356"
+    },
+    "paper-open-world-tracking": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2104.11221",
+      "path": "papers/opening_up_open_world_tracking.pdf",
+      "source": "https://arxiv.org/abs/2104.11221"
+    },
+    "paper-hota": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2009.07736",
+      "path": "papers/hota_metric.pdf",
+      "source": "https://arxiv.org/abs/2009.07736"
+    },
+    "paper-deepsort": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/1703.07402",
+      "path": "papers/deep_sort.pdf",
+      "source": "https://arxiv.org/abs/1703.07402"
+    },
+    "paper-bytetrack": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2110.06864",
+      "path": "papers/bytetrack.pdf",
+      "source": "https://arxiv.org/abs/2110.06864"
+    },
+    "paper-strongsort": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2202.13514",
+      "path": "papers/strongsort.pdf",
+      "source": "https://arxiv.org/abs/2202.13514"
+    },
+    "paper-botsort": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2206.14651",
+      "path": "papers/bot_sort.pdf",
+      "source": "https://arxiv.org/abs/2206.14651"
+    },
+    "paper-dinov2": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2304.07193",
+      "path": "papers/dinov2.pdf",
+      "source": "https://arxiv.org/abs/2304.07193"
+    },
+    "paper-vit": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2010.11929",
+      "path": "papers/vision_transformer.pdf",
+      "source": "https://arxiv.org/abs/2010.11929"
+    },
+    "paper-grounding-dino": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2303.05499",
+      "path": "papers/grounding_dino.pdf",
+      "source": "https://arxiv.org/abs/2303.05499"
+    },
+    "paper-sam": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2304.02643",
+      "path": "papers/segment_anything.pdf",
+      "source": "https://arxiv.org/abs/2304.02643"
+    },
+    "paper-ovtrack": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2304.08408",
+      "path": "papers/ovtrack.pdf",
+      "source": "https://arxiv.org/abs/2304.08408"
+    },
+    "paper-video-owlvit": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2308.11093",
+      "path": "papers/video_owlvit.pdf",
+      "source": "https://arxiv.org/abs/2308.11093"
+    }
+  }
+}

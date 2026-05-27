@@ -1,0 +1,11 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:system",
+    "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+    "python.terminal.activateEnvironment": true,
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}\\external\\LoRAT-main"
+    ],
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}\\external\\LoRAT-main"
+    ]
+}
