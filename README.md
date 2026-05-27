@@ -196,23 +196,3 @@ Still to improve:
 ## Notes On LoRAT
 
 LoRAT is fundamentally a single-object tracker. This project adapts it to multi-object tracking by creating one tracking task per user-selected bounding box. That is enough for an interactive multi-object prototype, but it is not the same as a full detector-plus-reID MOT system.
-
-## Useful Commands
-
-Show all options for the GUI:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --help
-```
-
-Show all options for the dataset runner:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --help
-```
-
-Check Git status:
-
-```powershell
-git status -sb
-```
