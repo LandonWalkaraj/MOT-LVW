@@ -2,10 +2,6 @@
 
 LoRAT-based multi-object tracking experiments with an OpenCV desktop GUI.
 
-This repository is set up for a project goal along these lines:
-
-> Implement LoRAT for multi-object tracking on GPU/CUDA, exercise it on DanceTrack and MOT17, and provide a graphical interface where a user can place multiple bounding boxes and track all selected objects at the same time.
-
 The current code is a working project scaffold and prototype. It supports an interactive multi-box GUI, a LoRAT-backed tracking path, an OpenCV fallback path, and a headless runner for DanceTrack/MOT17-style sequences.
 
 ## What Is Included
