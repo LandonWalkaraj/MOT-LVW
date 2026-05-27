@@ -1,8 +1,96 @@
-# Multi-Object Tracker Setup Notes
+# MOT-LVW
 
-This workspace starts with a reproducible asset manifest and a Windows-friendly downloader for the week-one data, models, and reading list.
+LoRAT-based multi-object tracking experiments with an OpenCV desktop GUI.
 
-## Quick Start
+This repository is set up for a project goal along these lines:
+
+> Implement LoRAT for multi-object tracking on GPU/CUDA, exercise it on DanceTrack and MOT17, and provide a graphical interface where a user can place multiple bounding boxes and track all selected objects at the same time.
+
+The current code is a working project scaffold and prototype. It supports an interactive multi-box GUI, a LoRAT-backed tracking path, an OpenCV fallback path, and a headless runner for DanceTrack/MOT17-style sequences.
+
+## What Is Included
+
+- `programs/bounding_box_basic.py`: first single-object OpenCV CSRT tracker.
+- `programs/bounding_box_v2_opencv.py`: multi-object OpenCV prototype with ROI selection and optional scale/rotation behavior through CamShift.
+- `programs/bounding_box_v3_lorat.py`: multi-object GUI that wraps LoRAT as the tracking backend.
+- `programs/exercise_lorat_mot.py`: non-interactive DanceTrack/MOT17 exercise runner.
+- `scripts/fetch-assets.ps1`: downloads external code snapshots, model weights, papers, and dataset archives from `manifests/assets.json`.
+- `scripts/setup-lorat-env.ps1`: creates the Python environment and installs LoRAT/project dependencies.
+- `scripts/verify-lorat-env.ps1`: verifies imports, PyTorch device visibility, and basic LoRAT environment readiness.
+- `docs/`: notes about datasets, model assets, papers, and AMD/NVIDIA platform tradeoffs.
+
+Large local assets are intentionally not committed. Datasets, LoRAT weights, downloaded external repositories, generated outputs, PDFs, and `.venv` are ignored.
+
+## Repository Layout
+
+```text
+MOT-LVW/
+  docs/                       Project notes and platform references
+  manifests/assets.json        Download manifest for external assets
+  programs/                    Tracker GUIs and dataset exercise scripts
+  scripts/                     Windows setup and download helpers
+  requirements.txt             Project-level Python dependencies
+  README.md
+```
+
+After running the asset downloader, local-only folders may also appear:
+
+```text
+data/                          DanceTrack, MOT17, TAO, and raw archives
+external/                      Local LoRAT and TrackEval snapshots
+models/lorat/                  LoRAT checkpoint files
+outputs/                       GUI and dataset-run result files
+papers/                        Downloaded reference PDFs
+```
+
+Those folders are excluded from Git because they can be large or have their own licenses/terms.
+
+## Requirements
+
+- Windows PowerShell
+- Python 3.10 or newer
+- OpenCV GUI support
+- LoRAT assets downloaded through this repo's scripts
+- For CUDA runs: an NVIDIA GPU, CUDA-compatible PyTorch, and the matching PyTorch wheel index from pytorch.org
+
+The project can run on CPU for development and smoke tests. CUDA is only needed for the GPU/CUDA benchmark part of the work.
+
+## Setup
+
+Clone the repository:
+
+```powershell
+git clone https://github.com/LandonWalkaraj/MOT-LVW.git
+cd MOT-LVW
+```
+
+Fetch the core LoRAT assets:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\fetch-assets.ps1 -Asset week1-core
+```
+
+Create the Python environment:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-lorat-env.ps1
+```
+
+Verify the environment:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\verify-lorat-env.ps1
+```
+
+On an NVIDIA/CUDA machine, pass the PyTorch CUDA wheel index before installing dependencies:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-lorat-env.ps1 -TorchIndexUrl https://download.pytorch.org/whl/cu128
+```
+
+Use the CUDA index that matches the target machine and the current PyTorch install guidance.
+
+## Asset Downloads
 
 List available asset groups:
 
@@ -10,108 +98,127 @@ List available asset groups:
 powershell -ExecutionPolicy Bypass -File .\scripts\fetch-assets.ps1 -List
 ```
 
-Fetch the LoRAT code snapshot, TrackEval snapshot, LoRAT B/L/g weights, and core paper PDFs:
+Common downloads:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\fetch-assets.ps1 -Asset week1-core
-```
-
-Fetch the smallest useful dataset starter set:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\fetch-assets.ps1 -Asset week1-datasets-small
-```
-
-Fetch full dataset groups only when you are ready for the storage/time hit:
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\fetch-assets.ps1 -Asset dancetrack
 powershell -ExecutionPolicy Bypass -File .\scripts\fetch-assets.ps1 -Asset mot17
-powershell -ExecutionPolicy Bypass -File .\scripts\fetch-assets.ps1 -Asset tao-ow
 ```
 
-The TAO AVA/HACS components require a MOTChallenge login and manual terms acceptance. The downloader will warn instead of faking that step.
+Some MOTChallenge-hosted files may require a browser login or manual terms acceptance. If a scripted download fails, download the archive manually and place it in the matching `data/raw/...` location described in `manifests/assets.json`.
 
-## Python Environment
+## Run The GUI
 
-Create or update the local LoRAT debug environment:
+Run the LoRAT-backed multi-object GUI from a camera:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-lorat-env.ps1
+& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --device cpu --video 0
 ```
 
-Verify imports, PyTorch device visibility, TurboJPEG, and a CPU LoRAT dry-run:
+Run the GUI on a video file:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\verify-lorat-env.ps1
+& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --device cpu --video ".\path\to\video.mp4"
 ```
 
-This machine currently exposes AMD GPUs, so the default PyTorch install is CPU-only. The week-one CUDA benchmarks need an NVIDIA/CUDA machine or cloud runner.
-On an NVIDIA machine, pass the PyTorch CUDA wheel index selected from pytorch.org, for example:
+Run the GUI on an image sequence folder containing `img1`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\setup-lorat-env.ps1 -TorchIndexUrl https://download.pytorch.org/whl/cu128
+& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --device cpu --sequence ".\data\DanceTrack\val\dancetrack0001"
 ```
 
-## LoRAT GUI v3
-
-Version 3 connects the interactive multi-box GUI to the local LoRAT checkout. It uses OpenCV only for video/image I/O, drawing, and the desktop window; the tracking backend is LoRAT. On this AMD laptop, use CPU mode:
+On a CUDA machine:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding box v3.py" --device cpu --video 0
+& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --device cuda:0 --video ".\path\to\video.mp4"
 ```
 
-On a machine where PyTorch exposes an NVIDIA CUDA or AMD ROCm/HIP device, use the same script with:
+GUI controls:
+
+- Draw one or more boxes with the mouse.
+- Press `Enter` or `Space` to accept a box.
+- Press `c` to cancel the current selection.
+- Press `q` during playback to quit.
+
+The GUI writes MOTChallenge-format tracking rows under `outputs/lorat-gui` unless `--output` is provided. Use `--save-video` to write an annotated MP4.
+
+## OpenCV Prototype
+
+The v2 OpenCV prototype is useful when LoRAT assets are not ready yet:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding box v3.py" --device cuda:0 --video path\to\video.mp4
+& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v2_opencv.py" --video 0
 ```
 
-For DanceTrack or MOT17 image sequences, point the script at a sequence folder containing `img1`:
+This is not intended to match LoRAT performance. It is mainly for testing the GUI flow and multi-box interaction.
+
+## Exercise DanceTrack And MOT17
+
+The dataset runner initializes tracks from MOTChallenge-style ground truth and writes result files that can be inspected or evaluated later.
+
+List sequences:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding box v3.py" --device cpu --sequence path\to\DanceTrack\val\dancetrack0001
-& ".\.venv\Scripts\python.exe" ".\programs\bounding box v3.py" --device cpu --sequence path\to\MOT17\train\MOT17-02-FRCNN
+& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root ".\data\DanceTrack" --dataset dancetrack --split val --list-sequences
+& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root ".\data\MOTChallenge\MOT17" --dataset mot17 --split train --list-sequences
 ```
 
-The GUI lets the user place multiple initial boxes. Each box becomes one LoRAT single-object tracking task, batched through LoRAT's evaluator. Results are written in MOTChallenge format under `outputs/lorat-gui` unless `--output` is supplied.
-
-## DanceTrack and MOT17 Exercise Runs
-
-Use `programs/exercise_lorat_mot.py` for non-interactive dataset exercise runs. It reads MOTChallenge-style sequence folders, initializes LoRAT tracks from `gt/gt.txt`, and writes result files in MOTChallenge format.
-
-If a dataset archive is downloaded but not extracted:
+Run a short CPU smoke test:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root ".\data\raw\DanceTrack" --dataset dancetrack --extract-zips --list-sequences
+& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root ".\data\DanceTrack" --dataset dancetrack --split val --device cpu --max-sequences 1 --max-tracks 2 --max-frames 50
 ```
 
-List extracted sequences:
+Run MOT17 on CUDA:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root ".\data\raw\DanceTrack" --dataset dancetrack --split val --list-sequences
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root "path\to\MOT17" --dataset mot17 --split train --list-sequences
+& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root ".\data\MOTChallenge\MOT17" --dataset mot17 --split train --device cuda:0
 ```
 
-CPU smoke runs on this laptop:
+Results are written to `outputs/lorat-exercise` by default.
+
+## Current Status
+
+Implemented:
+
+- Multi-box OpenCV GUI selection.
+- LoRAT runtime integration through a local `external/LoRAT-main` checkout.
+- One LoRAT task per selected object, batched through LoRAT's evaluator.
+- MOTChallenge-format output writing.
+- DanceTrack/MOT17-style sequence discovery and smoke-run support.
+- CPU development path plus CUDA device option for machines with CUDA-enabled PyTorch.
+
+Still to improve:
+
+- Stronger re-identification when an object leaves and re-enters the frame.
+- More robust recovery after long occlusion or tracking loss.
+- Formal TrackEval evaluation wiring for final metrics.
+- Cleaner dataset download handling for files that require manual MOTChallenge login.
+- Packaging the GUI as a friendlier application entry point.
+
+## Notes On LoRAT
+
+LoRAT is fundamentally a single-object tracker. This project adapts it to multi-object tracking by creating one tracking task per user-selected bounding box. That is enough for an interactive multi-object prototype, but it is not the same as a full detector-plus-reID MOT system.
+
+The phrase "exercised on DanceTrack and MOT17" is handled here as dataset execution/testing, not LoRAT training. If a requirement specifically asks for training or fine-tuning on those datasets, that would be a separate training pipeline.
+
+## Useful Commands
+
+Show all options for the GUI:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root ".\data\raw\DanceTrack" --dataset dancetrack --split val --backend lorat --device cpu --max-sequences 1 --max-tracks 2 --max-frames 50
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root "path\to\MOT17" --dataset mot17 --split train --backend lorat --device cpu --max-sequences 1 --max-tracks 2 --max-frames 50
+& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --help
 ```
 
-On a CUDA or ROCm/HIP PyTorch machine, switch only the device:
+Show all options for the dataset runner:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --dataset-root "path\to\MOT17" --dataset mot17 --split train --backend lorat --device cuda:0
+& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --help
 ```
 
-## Notes
+Check Git status:
 
-- Asset definitions live in `manifests/assets.json`.
-- The downloader saves archives in `data/raw`, repositories in `external`, model weights in `models/lorat`, and paper PDFs in `papers`.
-- Use `-NoExtract` if you want to download large zip files without expanding them immediately.
-- Python is now available and the LoRAT debug environment is handled by `scripts/setup-lorat-env.ps1`. Git is still optional because the setup uses downloadable repository snapshots.
-
-See `docs/data_models_and_papers.md` for the source links, dataset/model choices, and initial paper reading order.
-See `docs/amd_nvidia_platform_notes.md` for platform notes on CUDA/NVIDIA vs ROCm/AMD for the LoRAT benchmark plan.
+```powershell
+git status -sb
+```

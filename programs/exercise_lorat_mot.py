@@ -13,7 +13,7 @@ import cv2
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-GUI_V3_PATH = PROJECT_ROOT / "programs" / "bounding box v3.py"
+GUI_V3_PATH = PROJECT_ROOT / "programs" / "bounding_box_v3_lorat.py"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "lorat-exercise"
 
 
