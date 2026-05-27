@@ -197,8 +197,6 @@ Still to improve:
 
 LoRAT is fundamentally a single-object tracker. This project adapts it to multi-object tracking by creating one tracking task per user-selected bounding box. That is enough for an interactive multi-object prototype, but it is not the same as a full detector-plus-reID MOT system.
 
-The phrase "exercised on DanceTrack and MOT17" is handled here as dataset execution/testing, not LoRAT training. If a requirement specifically asks for training or fine-tuning on those datasets, that would be a separate training pipeline.
-
 ## Useful Commands
 
 Show all options for the GUI:
