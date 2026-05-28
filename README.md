@@ -13,7 +13,6 @@ The current code is a working project scaffold and prototype. It supports an int
 - `scripts/fetch-assets.ps1`: downloads external code snapshots, model weights, papers, and dataset archives from `manifests/assets.json`.
 - `scripts/setup-lorat-env.ps1`: creates the Python environment and installs LoRAT/project dependencies.
 - `scripts/verify-lorat-env.ps1`: verifies imports, PyTorch device visibility, and basic LoRAT environment readiness.
-- `docs/`: notes about datasets, model assets, papers, and AMD/NVIDIA platform tradeoffs.
 
 Large local assets are intentionally not committed. Datasets, LoRAT weights, downloaded external repositories, generated outputs, PDFs, and `.venv` are ignored.
 
@@ -21,7 +20,6 @@ Large local assets are intentionally not committed. Datasets, LoRAT weights, dow
 
 ```text
 MOT-LVW/
-  docs/                       Project notes and platform references
   manifests/assets.json        Download manifest for external assets
   programs/                    Tracker GUIs and dataset exercise scripts
   scripts/                     Windows setup and download helpers
