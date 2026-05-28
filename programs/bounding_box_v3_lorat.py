@@ -40,6 +40,132 @@ class TrackState:
     confidence: Optional[float] = None
     lost_frames: int = 0
     tracker: Optional[object] = None
+    previous_bbox: Optional[BBox] = None
+    predicted_bbox: Optional[BBox] = None
+    raw_bbox: Optional[BBox] = None
+    velocity: BBox = (0.0, 0.0, 0.0, 0.0)
+    occluded_frames: int = 0
+    coordinator_state: str = ""
+
+
+class MultiObjectCoordinator:
+    def __init__(
+        self,
+        enabled: bool = True,
+        overlap_iou_threshold: float = 0.30,
+        normal_proposal_weight: float = 0.90,
+        occluded_proposal_weight: float = 0.45,
+        suspicious_proposal_weight: float = 0.25,
+        max_center_jump: float = 0.45,
+        max_scale_change: float = 0.65,
+        max_occlusion_frames: int = 20,
+        velocity_smoothing: float = 0.70,
+    ):
+        self.enabled = enabled
+        self.overlap_iou_threshold = overlap_iou_threshold
+        self.normal_proposal_weight = normal_proposal_weight
+        self.occluded_proposal_weight = occluded_proposal_weight
+        self.suspicious_proposal_weight = suspicious_proposal_weight
+        self.max_center_jump = max_center_jump
+        self.max_scale_change = max_scale_change
+        self.max_occlusion_frames = max_occlusion_frames
+        self.velocity_smoothing = velocity_smoothing
+
+    def resolve(
+        self,
+        tracks: Sequence[TrackState],
+        proposals: Dict[int, Tuple[BBox, Optional[float]]],
+    ) -> Dict[int, Tuple[BBox, Optional[float], str]]:
+        if not self.enabled:
+            return {
+                track_id: (proposal, confidence, "")
+                for track_id, (proposal, confidence) in proposals.items()
+            }
+
+        track_by_id = {track.track_id: track for track in tracks}
+        conflict_ids = self._find_conflicts(track_by_id, proposals)
+        updates: Dict[int, Tuple[BBox, Optional[float], str]] = {}
+
+        for track_id, (proposal, confidence) in proposals.items():
+            track = track_by_id.get(track_id)
+            if track is None:
+                continue
+
+            previous = track.bbox
+            predicted = predict_bbox(previous, track.velocity)
+            suspicious = self._is_suspicious(previous, predicted, proposal)
+            in_conflict = track_id in conflict_ids
+
+            if in_conflict:
+                proposal_weight = self.occluded_proposal_weight
+                state = "OCC"
+            else:
+                proposal_weight = self.normal_proposal_weight
+                state = ""
+
+            if suspicious:
+                proposal_weight = min(proposal_weight, self.suspicious_proposal_weight)
+                state = "SMOOTH" if not state else state
+
+            if track.occluded_frames >= self.max_occlusion_frames:
+                proposal_weight = max(proposal_weight, self.normal_proposal_weight)
+                state = ""
+
+            final_bbox = clamp_bbox_size(blend_bbox(predicted, proposal, proposal_weight))
+            self._update_track_motion(track, previous, final_bbox, predicted, proposal, in_conflict, state)
+            updates[track_id] = (final_bbox, confidence, state)
+
+        return updates
+
+    def _find_conflicts(
+        self,
+        track_by_id: Dict[int, TrackState],
+        proposals: Dict[int, Tuple[BBox, Optional[float]]],
+    ) -> set[int]:
+        conflict_ids: set[int] = set()
+        proposal_items = list(proposals.items())
+
+        for left_index, (left_id, (left_bbox, _)) in enumerate(proposal_items):
+            for right_id, (right_bbox, _) in proposal_items[left_index + 1 :]:
+                left_track = track_by_id.get(left_id)
+                right_track = track_by_id.get(right_id)
+                previous_iou = 0.0
+                if left_track is not None and right_track is not None:
+                    previous_iou = bbox_iou(left_track.bbox, right_track.bbox)
+
+                if max(bbox_iou(left_bbox, right_bbox), previous_iou) >= self.overlap_iou_threshold:
+                    conflict_ids.add(left_id)
+                    conflict_ids.add(right_id)
+
+        return conflict_ids
+
+    def _is_suspicious(self, previous: BBox, predicted: BBox, proposal: BBox) -> bool:
+        previous_diag = max(1.0, bbox_diagonal(previous))
+        center_jump = center_distance(predicted, proposal) / previous_diag
+
+        previous_area = max(1.0, previous[2] * previous[3])
+        proposal_area = max(1.0, proposal[2] * proposal[3])
+        scale_change = abs(proposal_area - previous_area) / previous_area
+
+        return center_jump > self.max_center_jump or scale_change > self.max_scale_change
+
+    def _update_track_motion(
+        self,
+        track: TrackState,
+        previous: BBox,
+        final_bbox: BBox,
+        predicted_bbox: BBox,
+        raw_bbox: BBox,
+        in_conflict: bool,
+        state: str,
+    ) -> None:
+        measured_velocity = bbox_delta(previous, final_bbox)
+        track.velocity = blend_bbox(measured_velocity, track.velocity, self.velocity_smoothing)
+        track.previous_bbox = previous
+        track.predicted_bbox = predicted_bbox
+        track.raw_bbox = raw_bbox
+        track.occluded_frames = track.occluded_frames + 1 if in_conflict else 0
+        track.coordinator_state = state
 
 
 class FrameSource:
@@ -116,6 +242,14 @@ class LoRATMultiObjectTracker:
         sequence_name: str,
         confidence_threshold: float,
         disable_amp: bool,
+        coordinator_enabled: bool = True,
+        overlap_iou_threshold: float = 0.30,
+        normal_proposal_weight: float = 0.90,
+        occluded_proposal_weight: float = 0.45,
+        suspicious_proposal_weight: float = 0.25,
+        max_center_jump: float = 0.45,
+        max_scale_change: float = 0.65,
+        max_occlusion_frames: int = 20,
     ):
         self.lorat_root = lorat_root.resolve()
         self.config_name = config_name
@@ -127,6 +261,16 @@ class LoRATMultiObjectTracker:
         self.sequence_name = sequence_name
         self.confidence_threshold = confidence_threshold
         self.disable_amp = disable_amp
+        self.coordinator = MultiObjectCoordinator(
+            enabled=coordinator_enabled,
+            overlap_iou_threshold=overlap_iou_threshold,
+            normal_proposal_weight=normal_proposal_weight,
+            occluded_proposal_weight=occluded_proposal_weight,
+            suspicious_proposal_weight=suspicious_proposal_weight,
+            max_center_jump=max_center_jump,
+            max_scale_change=max_scale_change,
+            max_occlusion_frames=max_occlusion_frames,
+        )
         self.tracks: List[TrackState] = []
         self.track_by_id: Dict[int, TrackState] = {}
         self.next_track_id = 1
@@ -273,6 +417,9 @@ class LoRATMultiObjectTracker:
                 bbox=tuple(float(value) for value in clipped),
                 color=color_for_track(track_id),
                 confidence=1.0,
+                previous_bbox=tuple(float(value) for value in clipped),
+                predicted_bbox=tuple(float(value) for value in clipped),
+                raw_bbox=tuple(float(value) for value in clipped),
             )
             self.tracks.append(track)
             self.track_by_id[track_id] = track
@@ -343,27 +490,45 @@ class LoRATMultiObjectTracker:
 
     def _apply_evaluated_frames(self, outputs: Optional[dict]) -> None:
         evaluated_frames = outputs.get("evaluated_frames", []) if outputs is not None else []
+        proposals: Dict[int, Tuple[BBox, Optional[float]]] = {}
+        failed_track_ids = set()
+
         for result in evaluated_frames:
             track = self.track_by_id.get(result.id)
             if track is None:
                 continue
 
             if result.output_box is None:
-                track.ok = False
-                track.lost_frames += 1
+                failed_track_ids.add(track.track_id)
                 continue
 
             confidence = float(result.output_confidence) if result.output_confidence is not None else None
             if confidence is not None and confidence < self.confidence_threshold:
-                track.ok = False
                 track.confidence = confidence
-                track.lost_frames += 1
+                failed_track_ids.add(track.track_id)
                 continue
 
-            track.bbox = xyxy_to_xywh_tuple(result.output_box)
+            proposals[track.track_id] = (xyxy_to_xywh_tuple(result.output_box), confidence)
+
+        for track_id in failed_track_ids - set(proposals):
+            track = self.track_by_id.get(track_id)
+            if track is None:
+                continue
+            track.ok = False
+            track.lost_frames += 1
+            track.coordinator_state = "LOST"
+
+        resolved_updates = self.coordinator.resolve(self.tracks, proposals)
+        for track_id, (bbox, confidence, state) in resolved_updates.items():
+            track = self.track_by_id.get(track_id)
+            if track is None:
+                continue
+
+            track.bbox = bbox
             track.confidence = confidence
             track.ok = True
             track.lost_frames = 0
+            track.coordinator_state = state
 
     def _run_worker_tasks(self, worker_tasks: Sequence[object]):
         from trackit.data.protocol.eval_input import TrackerEvalData
@@ -427,6 +592,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tracks", type=int, default=8, help="Maximum simultaneous LoRAT tracks.")
     parser.add_argument("--confidence-threshold", type=float, default=0.02)
     parser.add_argument("--disable-amp", action="store_true", help="Disable LoRAT automatic mixed precision.")
+    parser.add_argument("--disable-coordinator", action="store_true", help="Disable overlap/motion coordination.")
+    parser.add_argument("--overlap-iou-threshold", type=float, default=0.30)
+    parser.add_argument("--normal-proposal-weight", type=float, default=0.90)
+    parser.add_argument("--occluded-proposal-weight", type=float, default=0.45)
+    parser.add_argument("--suspicious-proposal-weight", type=float, default=0.25)
+    parser.add_argument("--max-center-jump", type=float, default=0.45)
+    parser.add_argument("--max-scale-change", type=float, default=0.65)
+    parser.add_argument("--max-occlusion-frames", type=int, default=20)
     parser.add_argument("--output", type=Path, help="MOTChallenge-format result file.")
     parser.add_argument("--save-video", type=Path, help="Optional annotated MP4 output path.")
     parser.add_argument("--max-frames", type=int, default=0, help="Optional frame limit for smoke tests.")
@@ -500,6 +673,14 @@ def create_backend(args: argparse.Namespace, source: FrameSource):
         source.name,
         args.confidence_threshold,
         args.disable_amp,
+        not args.disable_coordinator,
+        args.overlap_iou_threshold,
+        args.normal_proposal_weight,
+        args.occluded_proposal_weight,
+        args.suspicious_proposal_weight,
+        args.max_center_jump,
+        args.max_scale_change,
+        args.max_occlusion_frames,
     )
 
 
@@ -539,6 +720,65 @@ def xywh_to_xyxy_np(bbox: BBox) -> np.ndarray:
 def xyxy_to_xywh_tuple(bbox: np.ndarray) -> BBox:
     x1, y1, x2, y2 = [float(value) for value in bbox]
     return x1, y1, max(0.0, x2 - x1), max(0.0, y2 - y1)
+
+
+def bbox_iou(left: BBox, right: BBox) -> float:
+    lx, ly, lw, lh = left
+    rx, ry, rw, rh = right
+    left_x2 = lx + lw
+    left_y2 = ly + lh
+    right_x2 = rx + rw
+    right_y2 = ry + rh
+
+    inter_x1 = max(lx, rx)
+    inter_y1 = max(ly, ry)
+    inter_x2 = min(left_x2, right_x2)
+    inter_y2 = min(left_y2, right_y2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    intersection = inter_w * inter_h
+    union = (lw * lh) + (rw * rh) - intersection
+    if union <= 0:
+        return 0.0
+    return intersection / union
+
+
+def bbox_center(bbox: BBox) -> Tuple[float, float]:
+    x, y, w, h = bbox
+    return x + (w / 2.0), y + (h / 2.0)
+
+
+def bbox_diagonal(bbox: BBox) -> float:
+    _, _, w, h = bbox
+    return float(np.hypot(w, h))
+
+
+def center_distance(left: BBox, right: BBox) -> float:
+    left_x, left_y = bbox_center(left)
+    right_x, right_y = bbox_center(right)
+    return float(np.hypot(left_x - right_x, left_y - right_y))
+
+
+def bbox_delta(previous: BBox, current: BBox) -> BBox:
+    return tuple(float(current_value - previous_value) for previous_value, current_value in zip(previous, current))
+
+
+def predict_bbox(bbox: BBox, velocity: BBox) -> BBox:
+    return clamp_bbox_size(tuple(float(value + delta) for value, delta in zip(bbox, velocity)))
+
+
+def clamp_bbox_size(bbox: BBox) -> BBox:
+    x, y, w, h = bbox
+    return float(x), float(y), max(1.0, float(w)), max(1.0, float(h))
+
+
+def blend_bbox(anchor: BBox, proposal: BBox, proposal_weight: float) -> BBox:
+    proposal_weight = max(0.0, min(1.0, proposal_weight))
+    anchor_weight = 1.0 - proposal_weight
+    return tuple(
+        float((anchor_value * anchor_weight) + (proposal_value * proposal_weight))
+        for anchor_value, proposal_value in zip(anchor, proposal)
+    )
 
 
 def select_boxes(frame: np.ndarray, title: str = "Select Objects") -> List[BBox]:
@@ -649,6 +889,8 @@ def draw_tracks(
         label = f"ID {track.track_id}"
         if track.confidence is not None:
             label += f" {track.confidence:.2f}"
+        if track.coordinator_state:
+            label += f" {track.coordinator_state}"
         if not track.ok:
             label += " LOST"
         cv2.rectangle(output, (x, y), (x + w, y + h), color, 2)
