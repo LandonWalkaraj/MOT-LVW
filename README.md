@@ -6,10 +6,10 @@ The current code is a working project scaffold and prototype. It supports an int
 
 ## What Is Included
 
-- `programs/bounding_box_basic.py`: first single-object OpenCV CSRT tracker.
-- `programs/bounding_box_v2_opencv.py`: multi-object OpenCV prototype with ROI selection and optional scale/rotation behavior through CamShift.
+- `programs/bounding_box_basic.py`: inital single-object OpenCV CSRT tracker, made for testing.
+- `programs/bounding_box_v2_opencv.py`: iterative from bounding box v1, made for testing.
 - `programs/bounding_box_v3_lorat.py`: multi-object GUI that wraps LoRAT as the tracking backend.
-- `programs/exercise_lorat_mot.py`: non-interactive DanceTrack/MOT17 exercise runner.
+- `programs/exercise_lorat_mot.py`: DanceTrack exercise runner using bounding box v3.
 - `scripts/fetch-assets.ps1`: downloads external code snapshots, model weights, papers, and dataset archives from `manifests/assets.json`.
 - `scripts/setup-lorat-env.ps1`: creates the Python environment and installs LoRAT/project dependencies.
 - `scripts/verify-lorat-env.ps1`: verifies imports, PyTorch device visibility, and basic LoRAT environment readiness.
@@ -53,11 +53,7 @@ The project can run on CPU for development and smoke tests. CUDA is only needed 
 
 ## Setup
 
-tbd
-
-## Asset Downloads
-
-tbd
+First, 
 
 ## Run The GUI
 
@@ -71,14 +67,6 @@ GUI controls:
 - Press `q` during playback to quit.
 
 The GUI writes MOTChallenge-format tracking rows under `outputs/lorat-gui` unless `--output` is provided. Use `--save-video` to write an annotated MP4.
-
-## OpenCV Prototype
-
-tbd
-
-## Exercise DanceTrack And MOT17
-
-tbd
 
 ## Current Status
 
@@ -101,4 +89,4 @@ Still to improve:
 
 ## Notes On LoRAT
 
-LoRAT is fundamentally a single-object tracker. This project adapts it to multi-object tracking by creating one tracking task per user-selected bounding box. That is enough for an interactive multi-object prototype, but it is not the same as a full detector-plus-reID MOT system.
+LoRAT from my research is fundamentally a single-object tracker. This project is an attempt to adapt it to multi-object tracking by creating one tracking task per user-selected bounding box. 
