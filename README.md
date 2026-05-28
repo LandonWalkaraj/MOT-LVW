@@ -13,7 +13,6 @@ The current code is a working project scaffold and prototype. It supports an int
 - `scripts/fetch-assets.ps1`: downloads external code snapshots, model weights, papers, and dataset archives from `manifests/assets.json`.
 - `scripts/setup-lorat-env.ps1`: creates the Python environment and installs LoRAT/project dependencies.
 - `scripts/verify-lorat-env.ps1`: verifies imports, PyTorch device visibility, and basic LoRAT environment readiness.
-- `docs/`: notes about datasets, model assets, papers, and AMD/NVIDIA platform tradeoffs.
 
 Large local assets are intentionally not committed. Datasets, LoRAT weights, downloaded external repositories, generated outputs, PDFs, and `.venv` are ignored.
 
@@ -21,7 +20,6 @@ Large local assets are intentionally not committed. Datasets, LoRAT weights, dow
 
 ```text
 MOT-LVW/
-  docs/                       Project notes and platform references
   manifests/assets.json        Download manifest for external assets
   programs/                    Tracker GUIs and dataset exercise scripts
   scripts/                     Windows setup and download helpers
@@ -75,17 +73,6 @@ Implemented:
 - Multi-box OpenCV GUI selection.
 - LoRAT runtime integration through a local `external/LoRAT-main` checkout.
 - One LoRAT task per selected object, batched through LoRAT's evaluator.
-- MOTChallenge-format output writing.
-- DanceTrack/MOT17-style sequence discovery and smoke-run support.
-- CPU development path plus CUDA device option for machines with CUDA-enabled PyTorch.
-
-Still to improve:
-
-- Stronger re-identification when an object leaves and re-enters the frame.
-- More robust recovery after long occlusion or tracking loss.
-- Formal TrackEval evaluation wiring for final metrics.
-- Cleaner dataset download handling for files that require manual MOTChallenge login.
-- Packaging the GUI as a friendlier application entry point.
 
 ## Notes On LoRAT
 
