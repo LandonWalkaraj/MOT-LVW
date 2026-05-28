@@ -75,17 +75,6 @@ Implemented:
 - Multi-box OpenCV GUI selection.
 - LoRAT runtime integration through a local `external/LoRAT-main` checkout.
 - One LoRAT task per selected object, batched through LoRAT's evaluator.
-- MOTChallenge-format output writing.
-- DanceTrack/MOT17-style sequence discovery and smoke-run support.
-- CPU development path plus CUDA device option for machines with CUDA-enabled PyTorch.
-
-Still to improve:
-
-- Stronger re-identification when an object leaves and re-enters the frame.
-- More robust recovery after long occlusion or tracking loss.
-- Formal TrackEval evaluation wiring for final metrics.
-- Cleaner dataset download handling for files that require manual MOTChallenge login.
-- Packaging the GUI as a friendlier application entry point.
 
 ## Notes On LoRAT
 
