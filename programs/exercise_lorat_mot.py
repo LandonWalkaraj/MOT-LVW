@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GUI_V3_PATH = PROJECT_ROOT / "programs" / "bounding_box_v3_lorat.py"
 DEFAULT_DATASET_ROOT = PROJECT_ROOT / "data" / "raw" / "DanceTrack"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "lorat-exercise" / "dancetrack"
+DEFAULT_DEBUG_DIR = PROJECT_ROOT / "outputs" / "debug"
 LORAT_CONFIG_CHOICES = ("B-224", "B-378", "L-224", "L-378", "g-224", "g-378")
 
 
@@ -84,10 +85,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comparison-csv", type=Path, help="Optional path for model comparison CSV output.")
     parser.add_argument("--comparison-md", type=Path, help="Optional path for model comparison Markdown output.")
     parser.add_argument("--weight-path", type=Path, help="Optional LoRAT weight override.")
-    parser.add_argument("--max-tracks", type=int, default=8, help="Maximum tracks initialized per sequence.")
+    parser.add_argument("--max-tracks", type=int, default=0, help="Optional track cap. 0 means no cap.")
+    parser.add_argument("--track-batch-size", type=int, default=8, help="Internal LoRAT batch size for processing tracks.")
     parser.add_argument("--max-frames", type=int, default=150, help="Frames to process per sequence; 0 means full sequence.")
     parser.add_argument("--max-sequences", type=int, default=0, help="Limit number of sequences; 0 means all selected.")
     parser.add_argument("--init-frame", default="auto", help="1-based frame number or auto.")
+    parser.add_argument(
+        "--gt-init",
+        action="store_true",
+        help="Initialize boxes from ground truth instead of selecting them in the GUI.",
+    )
     parser.add_argument(
         "--min-init-tracks",
         type=int,
@@ -110,6 +117,19 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Skip annotated MP4 preview output.",
     )
+    parser.add_argument(
+        "--interactive-playback",
+        dest="interactive_playback",
+        action="store_true",
+        default=True,
+        help="Show playback during manual runs so boxes can be added when objects appear.",
+    )
+    parser.add_argument(
+        "--no-interactive-playback",
+        dest="interactive_playback",
+        action="store_false",
+        help="Do not show playback windows during manual runs.",
+    )
     parser.add_argument("--confidence-threshold", type=float, default=0.02)
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--disable-coordinator", action="store_true", help="Disable overlap/motion coordination.")
@@ -120,6 +140,85 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-center-jump", type=float, default=0.45)
     parser.add_argument("--max-scale-change", type=float, default=0.65)
     parser.add_argument("--max-occlusion-frames", type=int, default=20)
+    parser.add_argument("--detector", choices=("none", "hog"), default="none", help="Optional detector refresh. HOG is person-specific.")
+    parser.add_argument("--detector-interval", type=int, default=5, help="Run detector every N frames.")
+    parser.add_argument("--max-detections", type=int, default=12, help="Maximum detector boxes considered per frame.")
+    parser.add_argument("--association-min-score", type=float, default=0.15)
+    parser.add_argument("--reid-weight", type=float, default=0.45)
+    parser.add_argument("--motion-weight", type=float, default=0.30)
+    parser.add_argument("--iou-weight", type=float, default=0.15)
+    parser.add_argument("--source-weight", type=float, default=0.10)
+    parser.add_argument("--appearance-update-rate", type=float, default=0.08)
+    parser.add_argument("--appearance-bank-size", type=int, default=8)
+    parser.add_argument("--appearance-commit-min-score", type=float, default=0.48)
+    parser.add_argument("--appearance-commit-min-margin", type=float, default=0.04)
+    parser.add_argument("--appearance-commit-min-similarity", type=float, default=0.35)
+    parser.add_argument("--ambiguous-assignment-margin", type=float, default=0.04)
+    parser.add_argument("--max-track-overlap-iou", type=float, default=0.70)
+    parser.add_argument("--pair-memory-overlap-iou", type=float, default=0.35)
+    parser.add_argument("--pair-memory-min-gap", type=float, default=6.0)
+    parser.add_argument("--pair-memory-max-age", type=int, default=45)
+    parser.add_argument("--pair-memory-strength", type=float, default=0.75)
+    parser.add_argument("--source-switch-penalty", type=float, default=0.08)
+    parser.add_argument("--reid-gate", type=float, default=0.28)
+    parser.add_argument("--reid-competition-weight", type=float, default=0.20)
+    parser.add_argument("--reid-competition-margin", type=float, default=0.04)
+    parser.add_argument("--trajectory-history-size", type=int, default=12)
+    parser.add_argument("--trajectory-weight", type=float, default=0.30)
+    parser.add_argument("--trajectory-guard-min-score", type=float, default=0.25)
+    parser.add_argument("--trajectory-guard-proposal-weight", type=float, default=0.50)
+    parser.add_argument("--trajectory-penalty-weight", type=float, default=0.20)
+    parser.add_argument("--recent-memory-frames", type=int, default=10)
+    parser.add_argument("--recent-memory-max-shift-fraction", type=float, default=0.25)
+    parser.add_argument("--recent-memory-min-shift-px", type=float, default=4.0)
+    parser.add_argument("--recent-memory-weight", type=float, default=0.12)
+    parser.add_argument("--recent-memory-competition-weight", type=float, default=0.25)
+    parser.add_argument("--identity-reject-memory-score", type=float, default=0.12)
+    parser.add_argument("--identity-reject-min-score", type=float, default=0.38)
+    parser.add_argument("--identity-reject-motion-score", type=float, default=0.55)
+    parser.add_argument("--identity-reject-competition-penalty", type=float, default=0.05)
+    parser.add_argument("--guarded-max-scale-change", type=float, default=0.25)
+    parser.add_argument("--direction-guard-min-score", type=float, default=0.35)
+    parser.add_argument("--direction-penalty-weight", type=float, default=0.30)
+    parser.add_argument("--bottom-guard-min-score", type=float, default=0.40)
+    parser.add_argument("--bottom-penalty-weight", type=float, default=0.25)
+    parser.add_argument("--center-anchor-max-shift-fraction", type=float, default=0.25)
+    parser.add_argument("--center-anchor-min-shift-px", type=float, default=4.0)
+    parser.add_argument("--extent-anchor-max-upward-fraction", type=float, default=0.12)
+    parser.add_argument("--extent-anchor-min-scale", type=float, default=0.80)
+    parser.add_argument(
+        "--enable-memory-recovery",
+        dest="memory_recovery_enabled",
+        action="store_true",
+        default=True,
+        help="Add object-agnostic memory-matched recovery candidates near the predicted track location.",
+    )
+    parser.add_argument(
+        "--disable-memory-recovery",
+        dest="memory_recovery_enabled",
+        action="store_false",
+        help="Disable memory-matched recovery candidates.",
+    )
+    parser.add_argument("--memory-recovery-min-score", type=float, default=0.58)
+    parser.add_argument("--memory-recovery-search-radius", type=float, default=0.90)
+    parser.add_argument("--memory-recovery-scale-step", type=float, default=0.15)
+    parser.add_argument(
+        "--enable-guard-resync",
+        dest="resync_guarded_tracks",
+        action="store_true",
+        default=False,
+        help="Reinitialize LoRAT on coordinator-guarded boxes. Off by default because it can overcorrect.",
+    )
+    parser.add_argument(
+        "--disable-guard-resync",
+        dest="resync_guarded_tracks",
+        action="store_false",
+        help="Keep LoRAT internal state unchanged after coordinator guards.",
+    )
+    parser.add_argument("--guard-resync-min-interval", type=int, default=1)
+    parser.add_argument("--debug-log", type=Path, help="Coordinator debug CSV output path or directory. Defaults to outputs/debug.")
+    parser.add_argument("--debug-frame-start", type=int, default=0, help="First frame to include in --debug-log; 0 means all.")
+    parser.add_argument("--debug-frame-end", type=int, default=0, help="Last frame to include in --debug-log; 0 means all.")
     return parser.parse_args()
 
 
@@ -224,7 +323,7 @@ def pick_initial_rows(
             if row.confidence != 0 and row.class_id in class_id_set and row.visibility >= min_visibility
         ]
         rows.sort(key=lambda row: row.track_id)
-        return rows[:max_tracks]
+        return rows[:max_tracks] if max_tracks > 0 else rows
 
     if init_frame_arg != "auto":
         frame = int(init_frame_arg)
@@ -240,7 +339,9 @@ def pick_initial_rows(
             candidates.append((frame, rows))
 
     if candidates:
-        required_tracks = max(1, min(min_init_tracks, max_tracks))
+        required_tracks = max(1, min_init_tracks)
+        if max_tracks > 0:
+            required_tracks = min(required_tracks, max_tracks)
         enough_tracks = [(frame, rows) for frame, rows in candidates if len(rows) >= required_tracks]
         ranked_candidates = enough_tracks or candidates
         ranked_candidates.sort(key=lambda item: (-len(item[1]), item[0]))
@@ -250,6 +351,12 @@ def pick_initial_rows(
 
 def frame_to_image_index(frame_number: int) -> int:
     return frame_number - 1
+
+
+def manual_init_frame(init_frame_arg: str) -> int:
+    if init_frame_arg == "auto":
+        return 1
+    return int(init_frame_arg)
 
 
 def bbox_iou(
@@ -300,6 +407,41 @@ def update_overlap_metrics(
         metrics["iou_sum"] += score
         if score >= 0.5:
             metrics["hit50"] += 1
+
+
+def match_boxes_to_gt_ids(
+    boxes: Sequence[Tuple[float, float, float, float]],
+    gt_rows: Sequence[GroundTruthRow],
+    class_ids: Sequence[int],
+    min_visibility: float,
+    min_iou: float = 0.05,
+) -> List[Optional[int]]:
+    class_id_set = set(class_ids or [1])
+    usable_rows = [
+        row
+        for row in gt_rows
+        if row.confidence != 0 and row.class_id in class_id_set and row.visibility >= min_visibility
+    ]
+    available_indexes = set(range(len(usable_rows)))
+    matches: List[Optional[int]] = []
+
+    for box in boxes:
+        best_index = None
+        best_iou = 0.0
+        for row_index in available_indexes:
+            score = bbox_iou(box, usable_rows[row_index].bbox)
+            if score > best_iou:
+                best_iou = score
+                best_index = row_index
+
+        if best_index is None or best_iou < min_iou:
+            matches.append(None)
+            continue
+
+        matches.append(usable_rows[best_index].track_id)
+        available_indexes.remove(best_index)
+
+    return matches
 
 
 def lorat_config_metadata(config: str) -> Tuple[str, int]:
@@ -387,6 +529,7 @@ def build_backend(gui_v3, args: argparse.Namespace, sequence_name: str, fps: flo
         weight_path,
         args.device,
         args.max_tracks,
+        args.track_batch_size,
         fps,
         length,
         sequence_name,
@@ -400,7 +543,75 @@ def build_backend(gui_v3, args: argparse.Namespace, sequence_name: str, fps: flo
         args.max_center_jump,
         args.max_scale_change,
         args.max_occlusion_frames,
+        args.detector,
+        args.detector_interval,
+        args.max_detections,
+        args.association_min_score,
+        args.reid_weight,
+        args.motion_weight,
+        args.iou_weight,
+        args.source_weight,
+        args.appearance_update_rate,
+        args.appearance_bank_size,
+        args.appearance_commit_min_score,
+        args.appearance_commit_min_margin,
+        args.appearance_commit_min_similarity,
+        args.ambiguous_assignment_margin,
+        args.max_track_overlap_iou,
+        args.pair_memory_overlap_iou,
+        args.pair_memory_min_gap,
+        args.pair_memory_max_age,
+        args.pair_memory_strength,
+        args.source_switch_penalty,
+        args.reid_gate,
+        args.reid_competition_weight,
+        args.reid_competition_margin,
+        args.trajectory_history_size,
+        args.trajectory_weight,
+        args.trajectory_guard_min_score,
+        args.trajectory_guard_proposal_weight,
+        args.trajectory_penalty_weight,
+        args.recent_memory_frames,
+        args.recent_memory_max_shift_fraction,
+        args.recent_memory_min_shift_px,
+        args.recent_memory_weight,
+        args.recent_memory_competition_weight,
+        args.identity_reject_memory_score,
+        args.identity_reject_min_score,
+        args.identity_reject_motion_score,
+        args.identity_reject_competition_penalty,
+        args.guarded_max_scale_change,
+        args.direction_guard_min_score,
+        args.direction_penalty_weight,
+        args.bottom_guard_min_score,
+        args.bottom_penalty_weight,
+        args.center_anchor_max_shift_fraction,
+        args.center_anchor_min_shift_px,
+        args.extent_anchor_max_upward_fraction,
+        args.extent_anchor_min_scale,
+        args.resync_guarded_tracks,
+        args.guard_resync_min_interval,
+        args.memory_recovery_enabled,
+        args.memory_recovery_min_score,
+        args.memory_recovery_search_radius,
+        args.memory_recovery_scale_step,
     )
+
+
+def debug_log_path_for_sequence(
+    path: Optional[Path],
+    sequence_name: str,
+    backend: str,
+    lorat_config: str,
+) -> Path:
+    config_suffix = f"_{lorat_config}" if backend == "lorat" and lorat_config else ""
+    if path is None:
+        return DEFAULT_DEBUG_DIR / f"{sequence_name}_{backend}{config_suffix}_debug.csv"
+    if path.suffix.lower() == ".csv":
+        if len(getattr(path, "parts", ())) and "{sequence}" in str(path):
+            return Path(str(path).replace("{sequence}", sequence_name))
+        return path
+    return path / f"{sequence_name}_{backend}{config_suffix}_debug.csv"
 
 
 def run_sequence(gui_v3, args: argparse.Namespace, sequence_path: Path) -> RunSummary:
@@ -410,14 +621,23 @@ def run_sequence(gui_v3, args: argparse.Namespace, sequence_path: Path) -> RunSu
 
     gt_by_frame = read_gt(sequence_path)
     fps, sequence_length = read_sequence_info(sequence_path)
-    init_frame, init_rows = pick_initial_rows(
-        gt_by_frame,
-        args.init_frame,
-        args.class_id,
-        args.min_visibility,
-        args.max_tracks,
-        args.min_init_tracks,
-    )
+    init_rows: List[GroundTruthRow] = []
+    gt_track_ids: List[Optional[int]] = []
+    if args.gt_init:
+        init_frame, init_rows = pick_initial_rows(
+            gt_by_frame,
+            args.init_frame,
+            args.class_id,
+            args.min_visibility,
+            args.max_tracks,
+            args.min_init_tracks,
+        )
+        boxes = [row.bbox for row in init_rows]
+        gt_track_ids = [row.track_id for row in init_rows]
+    else:
+        init_frame = manual_init_frame(args.init_frame)
+        boxes = []
+
     init_index = frame_to_image_index(init_frame)
     if init_index >= len(image_paths):
         raise RuntimeError(f"Init frame {init_frame} is outside image sequence length {len(image_paths)}.")
@@ -435,10 +655,47 @@ def run_sequence(gui_v3, args: argparse.Namespace, sequence_path: Path) -> RunSu
     if init_frame_image is None:
         raise RuntimeError(f"Unable to read frame: {image_paths[init_index]}")
 
+    if not args.gt_init:
+        cache_key = (str(sequence_path.resolve()), init_frame)
+        manual_init_cache = getattr(args, "manual_init_cache", {})
+        cached_init = manual_init_cache.get(cache_key)
+
+        if cached_init is None:
+            title = f"Select Initial Boxes: {sequence_path.name} frame {init_frame}"
+            selected_boxes = gui_v3.select_boxes(init_frame_image, title)
+            if not selected_boxes:
+                raise RuntimeError("No initial boxes selected.")
+            if args.max_tracks > 0 and len(selected_boxes) > args.max_tracks:
+                print(f"Selected {len(selected_boxes)} boxes; keeping the first {args.max_tracks}.")
+                selected_boxes = selected_boxes[: args.max_tracks]
+
+            boxes = [tuple(float(value) for value in box) for box in selected_boxes]
+            gt_track_ids = match_boxes_to_gt_ids(
+                boxes,
+                gt_by_frame.get(init_frame, []),
+                args.class_id,
+                args.min_visibility,
+            )
+            manual_init_cache[cache_key] = (boxes, gt_track_ids)
+        else:
+            boxes, gt_track_ids = cached_init
+
     mot_lines: List[str] = []
-    boxes = [row.bbox for row in init_rows]
+    debug_lines: List[str] = []
+    debug_path = debug_log_path_for_sequence(args.debug_log, sequence_path.name, args.backend, args.lorat_config)
+    outputs_written = False
+    last_frame_number = init_frame
     tracker_to_gt_id: Dict[int, int] = {}
     metrics = {"count": 0.0, "iou_sum": 0.0, "hit50": 0.0}
+
+    def flush_run_outputs() -> None:
+        nonlocal outputs_written
+        if outputs_written:
+            return
+        result_path.write_text("".join(mot_lines), encoding="utf-8")
+        gui_v3.write_debug_log(debug_path, debug_lines)
+        print(f"Wrote debug CSV: {debug_path}")
+        outputs_written = True
 
     end_index = len(image_paths) - 1
     if args.max_frames > 0:
@@ -446,13 +703,22 @@ def run_sequence(gui_v3, args: argparse.Namespace, sequence_path: Path) -> RunSu
 
     started_at = time.perf_counter()
     backend = build_backend(gui_v3, args, sequence_path.name, fps, sequence_length or len(image_paths))
+    interactive_playback = args.interactive_playback and not args.gt_init
     try:
         backend.initialize(init_frame_image, boxes, init_frame)
         tracker_to_gt_id = {
-            track.track_id: init_row.track_id
-            for track, init_row in zip(backend.tracks, init_rows)
+            track.track_id: gt_track_id
+            for track, gt_track_id in zip(backend.tracks, gt_track_ids)
+            if gt_track_id is not None
         }
         gui_v3.append_mot_results(mot_lines, init_frame, backend.tracks)
+        gui_v3.append_debug_rows(
+            debug_lines,
+            init_frame,
+            backend.tracks,
+            args.debug_frame_start,
+            args.debug_frame_end,
+        )
         update_overlap_metrics(metrics, backend.tracks, gt_by_frame, init_frame, tracker_to_gt_id, args.min_visibility)
 
         if args.save_video:
@@ -466,17 +732,67 @@ def run_sequence(gui_v3, args: argparse.Namespace, sequence_path: Path) -> RunSu
                 print(f"Skipping unreadable frame: {image_paths[image_index]}")
                 continue
             backend.update(frame, frame_number)
+            last_frame_number = frame_number
             gui_v3.append_mot_results(mot_lines, frame_number, backend.tracks)
+            gui_v3.append_debug_rows(
+                debug_lines,
+                frame_number,
+                backend.tracks,
+                args.debug_frame_start,
+                args.debug_frame_end,
+            )
             update_overlap_metrics(metrics, backend.tracks, gt_by_frame, frame_number, tracker_to_gt_id, args.min_visibility)
+
+            if interactive_playback:
+                shown = gui_v3.draw_tracks(frame, backend.tracks, frame_number, backend.backend_name)
+                cv2.imshow("LoRAT Exercise Playback", shown)
+                key = cv2.waitKey(max(1, int(1000 / max(1.0, fps)))) & 0xFF
+                if key == ord("q"):
+                    print(f"Quit requested at frame {frame_number}; flushing outputs.")
+                    break
+                if key == ord("a"):
+                    new_boxes = gui_v3.select_boxes(frame, f"Add Objects: {sequence_path.name} frame {frame_number}")
+                    if new_boxes:
+                        if args.max_tracks > 0:
+                            remaining_slots = max(0, args.max_tracks - len(backend.tracks))
+                            if len(new_boxes) > remaining_slots:
+                                print(f"Selected {len(new_boxes)} new boxes; keeping {remaining_slots} due to --max-tracks.")
+                                new_boxes = new_boxes[:remaining_slots]
+                        added_tracks = backend.add_tracks(frame, new_boxes, frame_number)
+                        new_gt_ids = match_boxes_to_gt_ids(
+                            new_boxes,
+                            gt_by_frame.get(frame_number, []),
+                            args.class_id,
+                            args.min_visibility,
+                        )
+                        for track, gt_track_id in zip(added_tracks, new_gt_ids):
+                            if gt_track_id is not None:
+                                tracker_to_gt_id[track.track_id] = gt_track_id
+                        gt_track_ids.extend(new_gt_ids[: len(added_tracks)])
+                        gui_v3.append_mot_results(mot_lines, frame_number, added_tracks)
+                        gui_v3.append_debug_rows(
+                            debug_lines,
+                            frame_number,
+                            backend.tracks,
+                            args.debug_frame_start,
+                            args.debug_frame_end,
+                        )
+
             if preview_writer is not None:
                 preview_writer.write(gui_v3.draw_tracks(frame, backend.tracks, frame_number, backend.backend_name))
     finally:
         backend.close()
         if preview_writer is not None:
             preview_writer.release()
+        if interactive_playback:
+            try:
+                cv2.destroyWindow("LoRAT Exercise Playback")
+            except cv2.error:
+                pass
+        flush_run_outputs()
 
     seconds = time.perf_counter() - started_at
-    frame_count = end_index - init_index + 1
+    frame_count = max(1, last_frame_number - init_frame + 1)
     run_fps = frame_count / seconds if seconds > 0 else 0.0
     mean_iou = metrics["iou_sum"] / metrics["count"] if metrics["count"] else None
     hit_rate_50 = metrics["hit50"] / metrics["count"] if metrics["count"] else None
@@ -485,8 +801,12 @@ def run_sequence(gui_v3, args: argparse.Namespace, sequence_path: Path) -> RunSu
         weight_path = gui_v3.LORAT_WEIGHT_BY_CONFIG[args.lorat_config]
     checkpoint_mb = weight_path.stat().st_size / (1024 * 1024) if weight_path and weight_path.exists() else 0.0
     backbone, input_size = lorat_config_metadata(args.lorat_config) if args.backend == "lorat" else ("", 0)
+    initialized_tracks = len(backend.tracks)
+    gt_track_text = ",".join(
+        str(gt_track_id) if gt_track_id is not None else "manual"
+        for gt_track_id in gt_track_ids[:initialized_tracks]
+    )
 
-    result_path.write_text("".join(mot_lines), encoding="utf-8")
     summary = RunSummary(
         sequence=sequence_path.name,
         backend=args.backend,
@@ -496,8 +816,8 @@ def run_sequence(gui_v3, args: argparse.Namespace, sequence_path: Path) -> RunSu
         device=args.device if args.backend == "lorat" else "",
         checkpoint_mb=checkpoint_mb,
         init_frame=init_frame,
-        tracks=len(init_rows),
-        gt_track_ids=",".join(str(row.track_id) for row in init_rows),
+        tracks=initialized_tracks,
+        gt_track_ids=gt_track_text,
         frames=frame_count,
         seconds=seconds,
         fps=run_fps,
@@ -510,8 +830,8 @@ def run_sequence(gui_v3, args: argparse.Namespace, sequence_path: Path) -> RunSu
     if mean_iou is not None and hit_rate_50 is not None:
         metric_text = f", mean_iou={mean_iou:.3f}, iou50={hit_rate_50:.3f}, fps={run_fps:.2f}"
     print(
-        f"{sequence_path.name}: init_frame={init_frame}, tracks={len(init_rows)}, "
-        f"track_ids={','.join(str(row.track_id) for row in init_rows)}, "
+        f"{sequence_path.name}: init_frame={init_frame}, tracks={initialized_tracks}, "
+        f"gt_ids={gt_track_text or 'manual'}, "
         f"frames={frame_count}{metric_text}, result={result_path}"
     )
     return summary
@@ -651,6 +971,7 @@ def main() -> int:
     gui_v3 = load_gui_v3_module()
     compare_configs = normalized_compare_configs(args.compare_configs)
     summaries: List[RunSummary] = []
+    args.manual_init_cache = {}
 
     if compare_configs:
         if args.weight_path:
