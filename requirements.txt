@@ -3,6 +3,7 @@
 # be selected explicitly on NVIDIA machines.
 numpy
 opencv-contrib-python
+scipy
 
 # LoRAT runtime dependencies mirrored here for GitHub users who want a normal
 # requirements file in addition to the official LoRAT requirements snapshot.
