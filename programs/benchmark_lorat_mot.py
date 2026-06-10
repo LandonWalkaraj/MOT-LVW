@@ -49,12 +49,39 @@ class TimingResult:
     mean_iou: Optional[float]
     iou50: Optional[float]
     preview_path: Optional[Path]
+    execution_mode: str = ""
+    gpu_profile: str = ""
+    gpu_name: str = ""
+    gpu_memory_allocated_mb: Optional[float] = None
+    gpu_memory_reserved_mb: Optional[float] = None
+    gpu_memory_peak_allocated_mb: Optional[float] = None
+    gpu_memory_peak_reserved_mb: Optional[float] = None
+    max_evaluator_batch: int = 0
+    evaluator_calls: int = 0
+    evaluator_tasks: int = 0
+    model_forward_calls: int = 0
+    model_forward_items: int = 0
+    max_model_forward_batch: int = 0
+    fusion_forward_calls: int = 0
+    fusion_forward_items: int = 0
+    max_fusion_forward_batch: int = 0
+    evaluator_tasks_per_update_frame: Optional[float] = None
+    model_forward_items_per_update_frame: Optional[float] = None
+    model_forward_items_per_bbox: Optional[float] = None
+    gating_decisions: int = 0
+    gating_primary_decisions: int = 0
+    gating_recovery_decisions: int = 0
+    gating_selected_slot_items: int = 0
+    gating_avg_slots_per_decision: float = 0.0
+    gating_recovery_reasons: str = ""
+    fps_sustains_25: Optional[bool] = None
 
 
 @dataclass(frozen=True)
 class AreaObservation:
     sequence: str
     lorat_config: str
+    execution_mode: str
     target_tracks: int
     actual_tracks: int
     frame: int
@@ -64,12 +91,18 @@ class AreaObservation:
     iou: float
     ok: bool
     state: str
+    sampled: bool = False
+    correct_object: Optional[bool] = None
+    identity_jump: Optional[bool] = None
+    occluded: Optional[bool] = None
+    center_jump_px: Optional[float] = None
 
 
 @dataclass(frozen=True)
 class AreaSummary:
     sequence: str
     lorat_config: str
+    execution_mode: str
     target_tracks: int
     actual_tracks: int
     area_bin: str
@@ -371,6 +404,7 @@ def collect_area_observations(
             AreaObservation(
                 sequence=sequence,
                 lorat_config=lorat_config,
+                execution_mode="v3-serial",
                 target_tracks=target_tracks,
                 actual_tracks=actual_tracks,
                 frame=frame_number,
@@ -585,7 +619,7 @@ def summarize_area_observations(
     reliable_mean_iou: float,
     min_area_samples: int,
 ) -> List[AreaSummary]:
-    grouped: Dict[Tuple[str, str, int, int, float, float], List[AreaObservation]] = {}
+    grouped: Dict[Tuple[str, str, str, int, int, float, float], List[AreaObservation]] = {}
     for observation in observations:
         bin_edges = find_area_bin(observation.area_px, area_bins)
         if bin_edges is None:
@@ -594,6 +628,7 @@ def summarize_area_observations(
         key = (
             observation.sequence,
             observation.lorat_config,
+            observation.execution_mode,
             observation.target_tracks,
             observation.actual_tracks,
             left,
@@ -603,7 +638,7 @@ def summarize_area_observations(
 
     summaries: List[AreaSummary] = []
     for key, rows in sorted(grouped.items(), key=lambda item: item[0]):
-        sequence, lorat_config, target_tracks, actual_tracks, left, right = key
+        sequence, lorat_config, execution_mode, target_tracks, actual_tracks, left, right = key
         ious = [row.iou for row in rows]
         areas = [row.area_px for row in rows]
         mean_iou = statistics.fmean(ious) if ious else None
@@ -615,6 +650,7 @@ def summarize_area_observations(
             AreaSummary(
                 sequence=sequence,
                 lorat_config=lorat_config,
+                execution_mode=execution_mode,
                 target_tracks=target_tracks,
                 actual_tracks=actual_tracks,
                 area_bin=area_bin_label(left, right),
@@ -666,6 +702,9 @@ def write_timing_csv(path: Path, rows: Sequence[TimingResult]) -> None:
         "backbone",
         "input_size",
         "device",
+        "execution_mode",
+        "gpu_profile",
+        "gpu_name",
         "checkpoint_mb",
         "target_tracks",
         "actual_tracks",
@@ -684,6 +723,29 @@ def write_timing_csv(path: Path, rows: Sequence[TimingResult]) -> None:
         "tracking_ms_per_bbox",
         "mean_iou",
         "iou50",
+        "gpu_memory_allocated_mb",
+        "gpu_memory_reserved_mb",
+        "gpu_memory_peak_allocated_mb",
+        "gpu_memory_peak_reserved_mb",
+        "max_evaluator_batch",
+        "evaluator_calls",
+        "evaluator_tasks",
+        "model_forward_calls",
+        "model_forward_items",
+        "max_model_forward_batch",
+        "fusion_forward_calls",
+        "fusion_forward_items",
+        "max_fusion_forward_batch",
+        "evaluator_tasks_per_update_frame",
+        "model_forward_items_per_update_frame",
+        "model_forward_items_per_bbox",
+        "gating_decisions",
+        "gating_primary_decisions",
+        "gating_recovery_decisions",
+        "gating_selected_slot_items",
+        "gating_avg_slots_per_decision",
+        "gating_recovery_reasons",
+        "fps_sustains_25",
         "preview_path",
     ]
     with path.open("w", newline="", encoding="utf-8") as file:
@@ -697,6 +759,9 @@ def write_timing_csv(path: Path, rows: Sequence[TimingResult]) -> None:
                     "backbone": row.backbone,
                     "input_size": row.input_size,
                     "device": row.device,
+                    "execution_mode": row.execution_mode,
+                    "gpu_profile": row.gpu_profile,
+                    "gpu_name": row.gpu_name,
                     "checkpoint_mb": f"{row.checkpoint_mb:.2f}",
                     "target_tracks": row.target_tracks,
                     "actual_tracks": row.actual_tracks,
@@ -715,6 +780,29 @@ def write_timing_csv(path: Path, rows: Sequence[TimingResult]) -> None:
                     "tracking_ms_per_bbox": optional_float(row.tracking_ms_per_bbox),
                     "mean_iou": optional_float(row.mean_iou),
                     "iou50": optional_float(row.iou50),
+                    "gpu_memory_allocated_mb": optional_float(row.gpu_memory_allocated_mb, 2),
+                    "gpu_memory_reserved_mb": optional_float(row.gpu_memory_reserved_mb, 2),
+                    "gpu_memory_peak_allocated_mb": optional_float(row.gpu_memory_peak_allocated_mb, 2),
+                    "gpu_memory_peak_reserved_mb": optional_float(row.gpu_memory_peak_reserved_mb, 2),
+                    "max_evaluator_batch": row.max_evaluator_batch,
+                    "evaluator_calls": row.evaluator_calls,
+                    "evaluator_tasks": row.evaluator_tasks,
+                    "model_forward_calls": row.model_forward_calls,
+                    "model_forward_items": row.model_forward_items,
+                    "max_model_forward_batch": row.max_model_forward_batch,
+                    "fusion_forward_calls": row.fusion_forward_calls,
+                    "fusion_forward_items": row.fusion_forward_items,
+                    "max_fusion_forward_batch": row.max_fusion_forward_batch,
+                    "evaluator_tasks_per_update_frame": optional_float(row.evaluator_tasks_per_update_frame),
+                    "model_forward_items_per_update_frame": optional_float(row.model_forward_items_per_update_frame),
+                    "model_forward_items_per_bbox": optional_float(row.model_forward_items_per_bbox),
+                    "gating_decisions": row.gating_decisions,
+                    "gating_primary_decisions": row.gating_primary_decisions,
+                    "gating_recovery_decisions": row.gating_recovery_decisions,
+                    "gating_selected_slot_items": row.gating_selected_slot_items,
+                    "gating_avg_slots_per_decision": optional_float(row.gating_avg_slots_per_decision),
+                    "gating_recovery_reasons": row.gating_recovery_reasons,
+                    "fps_sustains_25": "" if row.fps_sustains_25 is None else str(row.fps_sustains_25),
                     "preview_path": str(row.preview_path or ""),
                 }
             )
@@ -724,6 +812,7 @@ def write_area_csv(path: Path, rows: Sequence[AreaSummary]) -> None:
     fieldnames = [
         "sequence",
         "lorat_config",
+        "execution_mode",
         "target_tracks",
         "actual_tracks",
         "area_bin",
@@ -744,6 +833,7 @@ def write_area_csv(path: Path, rows: Sequence[AreaSummary]) -> None:
                 {
                     "sequence": row.sequence,
                     "lorat_config": row.lorat_config,
+                    "execution_mode": row.execution_mode,
                     "target_tracks": row.target_tracks,
                     "actual_tracks": row.actual_tracks,
                     "area_bin": row.area_bin,
@@ -763,6 +853,7 @@ def write_observations_csv(path: Path, rows: Sequence[AreaObservation]) -> None:
     fieldnames = [
         "sequence",
         "lorat_config",
+        "execution_mode",
         "target_tracks",
         "actual_tracks",
         "frame",
@@ -772,6 +863,11 @@ def write_observations_csv(path: Path, rows: Sequence[AreaObservation]) -> None:
         "iou",
         "ok",
         "state",
+        "sampled",
+        "correct_object",
+        "identity_jump",
+        "occluded",
+        "center_jump_px",
     ]
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -781,6 +877,7 @@ def write_observations_csv(path: Path, rows: Sequence[AreaObservation]) -> None:
                 {
                     "sequence": row.sequence,
                     "lorat_config": row.lorat_config,
+                    "execution_mode": row.execution_mode,
                     "target_tracks": row.target_tracks,
                     "actual_tracks": row.actual_tracks,
                     "frame": row.frame,
@@ -790,15 +887,20 @@ def write_observations_csv(path: Path, rows: Sequence[AreaObservation]) -> None:
                     "iou": f"{row.iou:.6f}",
                     "ok": int(row.ok),
                     "state": row.state,
+                    "sampled": int(row.sampled),
+                    "correct_object": "" if row.correct_object is None else int(row.correct_object),
+                    "identity_jump": "" if row.identity_jump is None else int(row.identity_jump),
+                    "occluded": "" if row.occluded is None else int(row.occluded),
+                    "center_jump_px": optional_float(row.center_jump_px, 3),
                 }
             )
 
 
-def smallest_reliable_area(rows: Sequence[AreaSummary]) -> Dict[Tuple[str, str, int], Optional[float]]:
-    result: Dict[Tuple[str, str, int], Optional[float]] = {}
-    grouped: Dict[Tuple[str, str, int], List[AreaSummary]] = {}
+def smallest_reliable_area(rows: Sequence[AreaSummary]) -> Dict[Tuple[str, str, str, int], Optional[float]]:
+    result: Dict[Tuple[str, str, str, int], Optional[float]] = {}
+    grouped: Dict[Tuple[str, str, str, int], List[AreaSummary]] = {}
     for row in rows:
-        grouped.setdefault((row.sequence, row.lorat_config, row.target_tracks), []).append(row)
+        grouped.setdefault((row.sequence, row.lorat_config, row.execution_mode, row.target_tracks), []).append(row)
     for key, group_rows in grouped.items():
         reliable_rows = [row for row in group_rows if row.reliable is True]
         result[key] = min((row.min_area_px for row in reliable_rows), default=None)
@@ -826,13 +928,13 @@ def write_summary_md(
         "",
         "## Timing By Object Count",
         "",
-        "| Sequence | Config | Target N | Actual N | Frames | Tracking Seconds | Tracking ms/box | Total ms/box | FPS tracking | Mean IoU | IoU@0.50 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Sequence | Config | Mode | Target N | Actual N | Frames | Tracking Seconds | Tracking ms/box | Total ms/box | FPS tracking | Mean IoU | IoU@0.50 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in timing_rows:
         lines.append(
             "| "
-            f"{row.sequence} | {row.lorat_config} | {row.target_tracks} | {row.actual_tracks} | "
+            f"{row.sequence} | {row.lorat_config} | {row.execution_mode} | {row.target_tracks} | {row.actual_tracks} | "
             f"{row.frames} | {row.tracking_seconds:.3f} | "
             f"{optional_float(row.tracking_ms_per_bbox, 3)} | {optional_float(row.total_ms_per_bbox, 3)} | "
             f"{optional_float(row.fps_tracking, 3)} | {optional_float(row.mean_iou, 3)} | {optional_float(row.iou50, 3)} |"
@@ -845,12 +947,12 @@ def write_summary_md(
                 "",
                 "## Preview Videos",
                 "",
-                "| Sequence | Config | Target N | Preview Path |",
-                "|---|---:|---:|---|",
+                "| Sequence | Config | Mode | Target N | Preview Path |",
+                "|---|---:|---:|---:|---|",
             ]
         )
         for row in preview_rows:
-            lines.append(f"| {row.sequence} | {row.lorat_config} | {row.target_tracks} | `{row.preview_path}` |")
+            lines.append(f"| {row.sequence} | {row.lorat_config} | {row.execution_mode} | {row.target_tracks} | `{row.preview_path}` |")
 
     reliable_floor = smallest_reliable_area(area_rows)
     lines.extend(
@@ -858,25 +960,25 @@ def write_summary_md(
             "",
             "## Small-Object Reliability",
             "",
-            "| Sequence | Config | Target N | Area Bin px | Samples | Mean Area | Mean IoU | IoU@0.50 | Unreliable Rate | Reliable |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Sequence | Config | Mode | Target N | Area Bin px | Samples | Mean Area | Mean IoU | IoU@0.50 | Unreliable Rate | Reliable |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in area_rows:
         lines.append(
             "| "
-            f"{row.sequence} | {row.lorat_config} | {row.target_tracks} | {row.area_bin} | "
+            f"{row.sequence} | {row.lorat_config} | {row.execution_mode} | {row.target_tracks} | {row.area_bin} | "
             f"{row.samples} | {optional_float(row.mean_area_px, 1)} | {optional_float(row.mean_iou, 3)} | "
             f"{optional_float(row.iou50, 3)} | {optional_float(row.unreliable_rate, 3)} | "
             f"{'' if row.reliable is None else row.reliable} |"
         )
 
     lines.extend(["", "## Smallest Reliable Area", ""])
-    lines.append("| Sequence | Config | Target N | Smallest Reliable Area px |")
-    lines.append("|---|---:|---:|---:|")
+    lines.append("| Sequence | Config | Mode | Target N | Smallest Reliable Area px |")
+    lines.append("|---|---:|---:|---:|---:|")
     for key, value in sorted(reliable_floor.items()):
-        sequence, config, target_tracks = key
-        lines.append(f"| {sequence} | {config} | {target_tracks} | {'' if value is None else int(value)} |")
+        sequence, config, execution_mode, target_tracks = key
+        lines.append(f"| {sequence} | {config} | {execution_mode} | {target_tracks} | {'' if value is None else int(value)} |")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

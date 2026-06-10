@@ -51,6 +51,7 @@
       "paper-tao",
       "paper-open-world-tracking",
       "paper-hota",
+      "paper-sotmot",
       "paper-deepsort",
       "paper-bytetrack"
     ],
@@ -64,6 +65,62 @@
       "paper-sam",
       "paper-ovtrack",
       "paper-video-owlvit"
+    ],
+    "papers-v8-training": [
+      "papers-core",
+      "paper-lorat-supplemental",
+      "paper-ostrack",
+      "paper-mixformer",
+      "paper-transt",
+      "paper-motr",
+      "paper-trackformer",
+      "paper-transtrack",
+      "paper-ovtr",
+      "paper-qdtrack",
+      "paper-fairmot",
+      "paper-centertrack",
+      "paper-owlvit-v8",
+      "paper-video-owlvit-v8",
+      "paper-ovtrack-v8",
+      "paper-class-agnostic-detection",
+      "paper-class-agnostic-multimodal-transformer",
+      "paper-ro-vit",
+      "paper-object-discovery-representation-networks",
+      "paper-object-agnostic-visual-relationships",
+      "paper-varifocalnet",
+      "paper-giou",
+      "paper-detr",
+      "paper-deformable-detr",
+      "paper-dinov2-v8",
+      "paper-vit-v8"
+    ],
+    "papers-week3-gap-fill": [
+      "paper-boosttrack",
+      "paper-boosttrack-plus-plus",
+      "paper-strongsort",
+      "paper-botsort",
+      "paper-oc-sort",
+      "paper-grounding-dino",
+      "paper-sam",
+      "paper-sam2",
+      "paper-stm",
+      "paper-stcn",
+      "paper-xmem",
+      "paper-aot",
+      "paper-deaot",
+      "paper-hdamot",
+      "paper-interactive-self-annotation",
+      "paper-video-annotation-active-learning",
+      "paper-vatic",
+      "paper-localization-aware-active-learning",
+      "paper-ppal",
+      "paper-efficient-video-annotation",
+      "paper-extreme-clicking",
+      "paper-snapper",
+      "paper-best-of-both-worlds-annotation",
+      "paper-what-annotate-next",
+      "paper-crowd-sam",
+      "paper-polygon-rnn-plus-plus"
     ]
   },
   "assets": {
@@ -261,6 +318,12 @@
       "path": "papers/hota_metric.pdf",
       "source": "https://arxiv.org/abs/2009.07736"
     },
+    "paper-sotmot": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content/CVPR2021/papers/Zheng_Improving_Multiple_Object_Tracking_With_Single_Object_Tracking_CVPR_2021_paper.pdf",
+      "path": "papers/Zheng_Improving_Multiple_Object_Tracking_With_Single_Object_Tracking_CVPR_2021_paper.pdf",
+      "source": "https://openaccess.thecvf.com/content/CVPR2021/html/Zheng_Improving_Multiple_Object_Tracking_With_Single_Object_Tracking_CVPR_2021_paper.html"
+    },
     "paper-deepsort": {
       "kind": "paper",
       "url": "https://arxiv.org/pdf/1703.07402",
@@ -276,25 +339,25 @@
     "paper-strongsort": {
       "kind": "paper",
       "url": "https://arxiv.org/pdf/2202.13514",
-      "path": "papers/strongsort.pdf",
+      "path": "papers/strongsort_make_deepsort_great_again.pdf",
       "source": "https://arxiv.org/abs/2202.13514"
     },
     "paper-botsort": {
       "kind": "paper",
       "url": "https://arxiv.org/pdf/2206.14651",
-      "path": "papers/bot_sort.pdf",
+      "path": "papers/bot_sort_robust_associations_multipedestrian_tracking.pdf",
       "source": "https://arxiv.org/abs/2206.14651"
     },
     "paper-dinov2": {
       "kind": "paper",
       "url": "https://arxiv.org/pdf/2304.07193",
-      "path": "papers/dinov2.pdf",
+      "path": "papers/dinov2_learning_robust_visual_features_without_supervision.pdf",
       "source": "https://arxiv.org/abs/2304.07193"
     },
     "paper-vit": {
       "kind": "paper",
       "url": "https://arxiv.org/pdf/2010.11929",
-      "path": "papers/vision_transformer.pdf",
+      "path": "papers/vision_transformer_an_image_is_worth_16x16_words.pdf",
       "source": "https://arxiv.org/abs/2010.11929"
     },
     "paper-grounding-dino": {
@@ -312,14 +375,296 @@
     "paper-ovtrack": {
       "kind": "paper",
       "url": "https://arxiv.org/pdf/2304.08408",
-      "path": "papers/ovtrack.pdf",
+      "path": "papers/ovtrack_open_vocabulary_mot.pdf",
       "source": "https://arxiv.org/abs/2304.08408"
     },
     "paper-video-owlvit": {
       "kind": "paper",
       "url": "https://arxiv.org/pdf/2308.11093",
-      "path": "papers/video_owlvit.pdf",
+      "path": "papers/video_owlvit_open_world_video_localization.pdf",
       "source": "https://arxiv.org/abs/2308.11093"
+    },
+    "paper-lorat-supplemental": {
+      "kind": "paper",
+      "url": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/papers/00113-supp.pdf",
+      "path": "papers/lorat_supplemental_training_details.pdf",
+      "source": "https://www.ecva.net/papers/eccv_2024/papers_ECCV/html/113_ECCV_2024_paper.php"
+    },
+    "paper-ostrack": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2203.11991",
+      "path": "papers/ostrack_one_stream_tracking.pdf",
+      "source": "https://arxiv.org/abs/2203.11991"
+    },
+    "paper-mixformer": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2203.11082",
+      "path": "papers/mixformer_end_to_end_tracking.pdf",
+      "source": "https://arxiv.org/abs/2203.11082"
+    },
+    "paper-transt": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content/CVPR2021/papers/Chen_Transformer_Tracking_CVPR_2021_paper.pdf",
+      "path": "papers/transt_transformer_tracking.pdf",
+      "source": "https://openaccess.thecvf.com/content/CVPR2021/html/Chen_Transformer_Tracking_CVPR_2021_paper.html"
+    },
+    "paper-motr": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2105.03247",
+      "path": "papers/motr_end_to_end_multi_object_tracking_transformer.pdf",
+      "source": "https://arxiv.org/abs/2105.03247"
+    },
+    "paper-trackformer": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content/CVPR2022/papers/Meinhardt_TrackFormer_Multi-Object_Tracking_With_Transformers_CVPR_2022_paper.pdf",
+      "path": "papers/trackformer_multi_object_tracking_transformers.pdf",
+      "source": "https://openaccess.thecvf.com/content/CVPR2022/html/Meinhardt_TrackFormer_Multi-Object_Tracking_With_Transformers_CVPR_2022_paper.html"
+    },
+    "paper-transtrack": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2012.15460",
+      "path": "papers/transtrack_multiple_object_tracking_transformer.pdf",
+      "source": "https://arxiv.org/abs/2012.15460"
+    },
+    "paper-ovtr": {
+      "kind": "paper",
+      "url": "https://openreview.net/pdf?id=GDS5eN65QY",
+      "path": "papers/ovtr_end_to_end_open_vocabulary_mot.pdf",
+      "source": "https://openreview.net/forum?id=GDS5eN65QY"
+    },
+    "paper-qdtrack": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2006.06664",
+      "path": "papers/qdtrack_quasi_dense_similarity_learning_mot.pdf",
+      "source": "https://arxiv.org/abs/2006.06664"
+    },
+    "paper-fairmot": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2004.01888",
+      "path": "papers/fairmot_detection_reid_mot.pdf",
+      "source": "https://arxiv.org/abs/2004.01888"
+    },
+    "paper-centertrack": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2004.01177",
+      "path": "papers/centertrack_tracking_objects_as_points.pdf",
+      "source": "https://arxiv.org/abs/2004.01177"
+    },
+    "paper-owlvit-v8": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2205.06230",
+      "path": "papers/owlvit_simple_open_vocabulary_detection_vit.pdf",
+      "source": "https://arxiv.org/abs/2205.06230"
+    },
+    "paper-video-owlvit-v8": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2308.11093",
+      "path": "papers/video_owlvit_open_world_video_localization.pdf",
+      "source": "https://arxiv.org/abs/2308.11093"
+    },
+    "paper-ovtrack-v8": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2304.08408",
+      "path": "papers/ovtrack_open_vocabulary_mot.pdf",
+      "source": "https://arxiv.org/abs/2304.08408"
+    },
+    "paper-class-agnostic-detection": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content/WACV2021/papers/Jaiswal_Class-Agnostic_Object_Detection_WACV_2021_paper.pdf",
+      "path": "papers/class_agnostic_object_detection_wacv2021.pdf",
+      "source": "https://openaccess.thecvf.com/content/WACV2021/html/Jaiswal_Class-Agnostic_Object_Detection_WACV_2021_paper.html"
+    },
+    "paper-class-agnostic-multimodal-transformer": {
+      "kind": "paper",
+      "url": "https://www.ecva.net/papers/eccv_2022/papers_ECCV/papers/136700507.pdf",
+      "path": "papers/class_agnostic_object_detection_multimodal_transformer.pdf",
+      "source": "https://www.ecva.net/papers/eccv_2022/papers_ECCV/html/1367_ECCV_2022_paper.php"
+    },
+    "paper-ro-vit": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content/CVPR2023/papers/Kim_Region-Aware_Pretraining_for_Open-Vocabulary_Object_Detection_With_Vision_Transformers_CVPR_2023_paper.pdf",
+      "path": "papers/ro_vit_region_aware_pretraining_open_vocabulary_detection.pdf",
+      "source": "https://openaccess.thecvf.com/content/CVPR2023/html/Kim_Region-Aware_Pretraining_for_Open-Vocabulary_Object_Detection_With_Vision_Transformers_CVPR_2023_paper.html"
+    },
+    "paper-object-discovery-representation-networks": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2203.08777",
+      "path": "papers/object_discovery_and_representation_networks.pdf",
+      "source": "https://arxiv.org/abs/2203.08777"
+    },
+    "paper-object-agnostic-visual-relationships": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content_ECCV_2018/papers/XU_YANG_Shuffle-Then-Assemble_Learning_Object-Agnostic_ECCV_2018_paper.pdf",
+      "path": "papers/shuffle_then_assemble_object_agnostic_visual_relationship_features.pdf",
+      "source": "https://openaccess.thecvf.com/content_ECCV_2018/html/Xu_Yang_Shuffle-Then-Assemble_Learning_ECCV_2018_paper.html"
+    },
+    "paper-varifocalnet": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content/CVPR2021/papers/Zhang_VarifocalNet_An_IoU-Aware_Dense_Object_Detector_CVPR_2021_paper.pdf",
+      "path": "papers/varifocalnet_iou_aware_dense_detector.pdf",
+      "source": "https://openaccess.thecvf.com/content/CVPR2021/html/Zhang_VarifocalNet_An_IoU-Aware_Dense_Object_Detector_CVPR_2021_paper.html"
+    },
+    "paper-giou": {
+      "kind": "paper",
+      "url": "https://giou.stanford.edu/GIoU.pdf",
+      "path": "papers/giou_generalized_intersection_over_union.pdf",
+      "source": "https://giou.stanford.edu/"
+    },
+    "paper-detr": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2005.12872",
+      "path": "papers/detr_end_to_end_object_detection.pdf",
+      "source": "https://arxiv.org/abs/2005.12872"
+    },
+    "paper-deformable-detr": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2010.04159",
+      "path": "papers/deformable_detr.pdf",
+      "source": "https://arxiv.org/abs/2010.04159"
+    },
+    "paper-dinov2-v8": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2304.07193",
+      "path": "papers/dinov2_learning_robust_visual_features_without_supervision.pdf",
+      "source": "https://arxiv.org/abs/2304.07193"
+    },
+    "paper-vit-v8": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2010.11929",
+      "path": "papers/vision_transformer_an_image_is_worth_16x16_words.pdf",
+      "source": "https://arxiv.org/abs/2010.11929"
+    },
+    "paper-boosttrack": {
+      "kind": "paper",
+      "url": "https://link.springer.com/content/pdf/10.1007/s00138-024-01531-5.pdf",
+      "path": "papers/boosttrack_similarity_confidence_mot.pdf",
+      "source": "https://link.springer.com/article/10.1007/s00138-024-01531-5"
+    },
+    "paper-boosttrack-plus-plus": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2408.13003",
+      "path": "papers/boosttrack_plus_plus_tracklet_information_mot.pdf",
+      "source": "https://arxiv.org/abs/2408.13003"
+    },
+    "paper-oc-sort": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2203.14360",
+      "path": "papers/oc_sort_observation_centric_sort.pdf",
+      "source": "https://arxiv.org/abs/2203.14360"
+    },
+    "paper-sam2": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2408.00714",
+      "path": "papers/sam2_segment_anything_images_videos.pdf",
+      "source": "https://arxiv.org/abs/2408.00714"
+    },
+    "paper-stm": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/1904.00607",
+      "path": "papers/stm_video_object_segmentation_space_time_memory.pdf",
+      "source": "https://arxiv.org/abs/1904.00607"
+    },
+    "paper-stcn": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2106.05210",
+      "path": "papers/stcn_rethinking_space_time_networks_vos.pdf",
+      "source": "https://arxiv.org/abs/2106.05210"
+    },
+    "paper-xmem": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2207.07115",
+      "path": "papers/xmem_long_term_video_object_segmentation.pdf",
+      "source": "https://arxiv.org/abs/2207.07115"
+    },
+    "paper-aot": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2106.02638",
+      "path": "papers/aot_associating_objects_with_transformers_vos.pdf",
+      "source": "https://arxiv.org/abs/2106.02638"
+    },
+    "paper-deaot": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2210.09782",
+      "path": "papers/deaot_decoupling_features_hierarchical_propagation_vos.pdf",
+      "source": "https://arxiv.org/abs/2210.09782"
+    },
+    "paper-hdamot": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content/ICCV2023/papers/Li_Heterogeneous_Diversity_Driven_Active_Learning_for_Multi-Object_Tracking_ICCV_2023_paper.pdf",
+      "path": "papers/hdamot_active_learning_multi_object_tracking.pdf",
+      "source": "https://openaccess.thecvf.com/content/ICCV2023/html/Li_Heterogeneous_Diversity_Driven_Active_Learning_for_Multi-Object_Tracking_ICCV_2023_paper.html"
+    },
+    "paper-interactive-self-annotation": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content_WACV_2020/papers/Le_Toward_Interactive_Self-Annotation_For_Video_Object_Bounding_Box_Recurrent_Self-Learning_WACV_2020_paper.pdf",
+      "path": "papers/interactive_self_annotation_video_object_bounding_box.pdf",
+      "source": "https://openaccess.thecvf.com/WACV2020"
+    },
+    "paper-video-annotation-active-learning": {
+      "kind": "paper",
+      "url": "https://papers.neurips.cc/paper/4233-video-annotation-and-tracking-with-active-learning.pdf",
+      "path": "papers/video_annotation_tracking_active_learning.pdf",
+      "source": "https://papers.neurips.cc/paper/4233-video-annotation-and-tracking-with-active-learning"
+    },
+    "paper-vatic": {
+      "kind": "paper",
+      "url": "https://www.cs.columbia.edu/~vondrick/vatic/ijcv.pdf",
+      "path": "papers/vatic_efficient_crowdsourced_video_annotation.pdf",
+      "source": "https://www.cs.columbia.edu/~vondrick/vatic/"
+    },
+    "paper-localization-aware-active-learning": {
+      "kind": "paper",
+      "url": "https://merl.com/publications/docs/TR2018-166.pdf",
+      "path": "papers/localization_aware_active_learning_object_detection.pdf",
+      "source": "https://arxiv.org/abs/1801.05124"
+    },
+    "paper-ppal": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content/CVPR2024/papers/Yang_Plug_and_Play_Active_Learning_for_Object_Detection_CVPR_2024_paper.pdf",
+      "path": "papers/plug_and_play_active_learning_object_detection.pdf",
+      "source": "https://arxiv.org/abs/2211.11612"
+    },
+    "paper-efficient-video-annotation": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content/WACV2021/papers/Kuznetsova_Efficient_Video_Annotation_With_Visual_Interpolation_and_Frame_Selection_Guidance_WACV_2021_paper.pdf",
+      "path": "papers/efficient_video_annotation_visual_interpolation_frame_selection.pdf",
+      "source": "https://arxiv.org/abs/2012.12554"
+    },
+    "paper-extreme-clicking": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/1708.02750",
+      "path": "papers/extreme_clicking_efficient_object_annotation.pdf",
+      "source": "https://arxiv.org/abs/1708.02750"
+    },
+    "paper-snapper": {
+      "kind": "paper",
+      "url": "https://assets.amazon.science/89/73/8070a384425fa1b56b9ffd67ab49/snapper-accelerating-bounding-box-annotation-in-object-detection-tasks-with-find-and-snap-tooling.pdf",
+      "path": "papers/snapper_accelerating_bounding_box_annotation.pdf",
+      "source": "https://www.amazon.science/publications/snapper-accelerating-bounding-box-annotation-in-object-detection-tasks-with-find-and-snap-tooling"
+    },
+    "paper-best-of-both-worlds-annotation": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content_cvpr_2015/papers/Russakovsky_Best_of_Both_2015_CVPR_paper.pdf",
+      "path": "papers/best_of_both_worlds_human_machine_object_annotation.pdf",
+      "source": "https://www.cv-foundation.org/openaccess/content_cvpr_2015/html/Russakovsky_Best_of_Both_2015_CVPR_paper.html"
+    },
+    "paper-what-annotate-next": {
+      "kind": "paper",
+      "url": "https://openaccess.thecvf.com/content_ECCV_2018/papers/Fabian_Caba_What_do_I_ECCV_2018_paper.pdf",
+      "path": "papers/what_do_i_annotate_next_active_learning_video.pdf",
+      "source": "https://openaccess.thecvf.com/content_ECCV_2018/html/Fabian_Caba_What_Do_I_Annotate_Next_An_Empirical_Study_ECCV_2018_paper.html"
+    },
+    "paper-crowd-sam": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/2407.11464",
+      "path": "papers/sam_smart_annotator_object_detection_crowded_scenes.pdf",
+      "source": "https://arxiv.org/abs/2407.11464"
+    },
+    "paper-polygon-rnn-plus-plus": {
+      "kind": "paper",
+      "url": "https://arxiv.org/pdf/1803.09693",
+      "path": "papers/polygon_rnn_plus_plus_interactive_annotation.pdf",
+      "source": "https://arxiv.org/abs/1803.09693"
     }
   }
 }
