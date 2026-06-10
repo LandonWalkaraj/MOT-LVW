@@ -262,6 +262,39 @@ Each benchmark run gets a unique folder and filename prefix such as `dancetrack0
 
 The timing CSV records total seconds, initialization seconds, tracking seconds, FPS, total milliseconds per produced box, tracking-only milliseconds per produced box, and the preview-video path. The area CSV groups each GT-matched tracker observation by ground-truth bounding-box pixel area and reports mean IoU, IoU@0.50, unreliable rate, and whether the bin meets the configured reliability rule.
 
+For the Week 2 V5 tracker, use the V5 benchmark runner:
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_v5.py" --device cuda:0 --max-track-count 8 --compare-configs B-224 L-224 g-224
+```
+
+`--max-track-count 8` runs 1 through 8 objects per video. You can still use sparse counts with `--track-counts 1,2,4,8`. By default, `benchmark_lorat_v5.py` compares:
+
+- `v4-serial-baseline`: the before-refactor baseline, using the V4 tracker with `track_batch_size=1` inside the benchmark runner.
+- `v5-shared`: the V5 tracker, which replaces the old mixed path with shared batched LoRAT inference.
+
+For a lab GPU run:
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_v5.py" --device cuda:0 --gpu-profile lab --max-track-count 16 --compare-configs B-224 L-224 --track-batch-size 16 --no-save-video
+```
+
+For an HPC GPU run:
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_v5.py" --device cuda:0 --gpu-profile hpc --max-track-count 32 --compare-configs B-224 L-224 --track-batch-size 32 --no-save-video
+```
+
+V5 benchmark outputs go under `outputs/lorat-benchmarks/v5-dancetrack` by default and include timing, area-reliability, observations, summary, preview-video files, and `model_comparison.csv`. The timing CSV includes `execution_mode`, `gpu_profile`, `gpu_name`, peak GPU memory, max evaluator batch, evaluator call counts when available, and whether the run sustained the default `--fps-threshold 25`.
+
+The observations CSV now performs the concrete object-correctness benchmark every `--identity-sample-interval 10` frames. A sampled row reports:
+
+- `correct_object`: true when the track still overlaps its initialized GT object with IoU at least `--identity-correct-iou 0.30` and no other visible GT object beats it by more than `--identity-competitor-margin 0.05`.
+- `identity_jump`: true when sampled center movement exceeds `--identity-jump-factor 2.0` times the current GT diagonal.
+- `occluded`: true when the V4 state marks an occlusion, miss, low-confidence hold, uncertain ID, or lost track.
+
+The Markdown summary reports before/after FPS speedup, GPU memory by object count, the maximum N sustaining at least 25 FPS for each `--gpu-profile`, and sampled object-correctness/jump/occlusion rates. Run the same command once on the lab GPU and once on the HPC GPU with matching track counts to fill both capacity rows with concrete values.
+
 ## V3 Behavior
 
 The v3 tracker adapts LoRAT, which is normally single-object tracking, into a multi-object workflow:
@@ -305,6 +338,30 @@ V4 tuning defaults live near the top of `programs/bounding_box_v4_lorat_memory.p
 - `--view-change-min-score`, `--view-change-min-motion`, `--view-change-min-confidence`, and `--view-change-max-lost-frames` tune same-target pose/view adaptation when a selected face or torso changes appearance as the person turns.
 - `--track-batch-size` controls how many LoRAT tasks run per forward chunk; `--lorat-slot-capacity` controls the maximum internal LoRAT task cache size.
 
+## V5 Shared-Backbone Tracker
+
+The V5 tracker lives in `programs/bounding_box_v5_lorat_shared.py`. It starts from V4's identity, occlusion, and LoRAT-memory logic, but removes the old serial/shared switch from the tracker itself. Active LoRAT tasks are always grouped into GPU batches using `--track-batch-size`.
+V5 instruments the LoRAT forward path to report `model_forward_calls`, `max_model_forward_batch`, `fusion_forward_calls`, and `max_fusion_forward_batch` in `timing_by_track_count.csv` and `model_comparison.csv`. Static inspection plus the smoke run show that LoRAT's one-stream evaluator stacks per-object template/search crops and calls the model once per V5 chunk; `LoRAT_DINOv2._fusion` then runs the transformer blocks once over that batch. This confirms batched model/backbone execution, not merely evaluator-level batching.
+
+One wording caveat: the current LoRAT inference path does not maintain separate per-object LoRA heads. LoRA weights are merged into the shared model when the optimized inference model is loaded, so the accurate claim is "batched shared LoRAT/ViT forward over per-object crops" rather than "per-object LoRA heads."
+The V5 default `--lorat-min-box-area` is `1`, keeping the hard accepted-box floor as small as possible while still preventing a zero-area box; pass `0` to disable the floor entirely. V5 also lowers `--lorat-trusted-size-floor-scale` to `0.30`, so the geometric floor no longer prevents legitimate small-object boxes.
+
+V5 handles shrinking boxes primarily by holding learning, not by forcing the output box large:
+
+- `--shrink-guard-window 6` compares the current accepted box area against the recent maximum area.
+- `--shrink-guard-area-ratio 0.72` marks cumulative shrink risk when area falls below 72 percent of that recent maximum.
+- `--shrink-guard-step-ratio 0.94` marks a single-frame shrink risk when area falls below 94 percent of the previous accepted area.
+- Shrink-risk boxes can still update the visible track, but they refresh LoRAT/ReID/size memory only when calibrated confidence is at least `--shrink-guard-min-confidence 0.70` and, when appearance memory exists, ReID is at least `--shrink-guard-min-reid 0.50`.
+- `--crop-information-min-score 0.12` holds learning from accepted boxes whose crop is too visually weak. The score uses crop pixel count, edge density, Laplacian texture variance, and grayscale contrast; `--crop-information-min-pixels 64` is where tiny-crop penalty stops.
+
+Run the V5 GUI:
+
+```powershell
+& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v5_lorat_shared.py" --device cuda:0 --sequence ".\data\raw\DanceTrack\val\val\dancetrack0065" --track-batch-size 16
+```
+
+The live GUI overlay now reports smoothed FPS, active object count, CUDA allocated/reserved memory, peak reserved memory, execution mode, evaluator call count, maximum evaluator batch size, model forward count, maximum model-forward batch, and maximum fusion-forward batch. CUDA memory is shown only when PyTorch exposes CUDA memory counters; CPU and DirectML runs display `GPU n/a`.
+
 The GUI/debug overlay may show state tags:
 
 - `LORAT`: track was updated directly from its owned LoRAT output.
@@ -313,6 +370,9 @@ The GUI/debug overlay may show state tags:
 - `MINAREA`: V4 expanded a box because its area fell below `--lorat-min-box-area`.
 - `SCALELIMIT`: V4 limited the accepted frame-to-frame area change.
 - `SIZEFLOOR`: V4 accepted LoRAT's center but expanded a collapsing width/height using trusted size memory.
+- `NOLEARN`: V5 accepted the visible box but did not refresh LoRAT template memory, ReID memory, trusted size memory, or last-reliable state from that crop.
+- `SHRINKRISK`: V5 held learning because the box was shrinking without enough confidence/ReID evidence.
+- `LOWINFO`: V5 held learning because the crop did not have enough visual information to trust as a new template.
 - `REID-LORAT`: a LoRAT proposal from another owned task was matched back to this track by the identity layer.
 - `ID_UNCERTAIN`: LoRAT produced a box, but the identity layer did not trust it enough to write it as this track.
 - `LOWCONF`, `REIDLOW`, `MOTIONLOW`, `PATHLOW`, or `REACQUIRE_LOWCONF`: LoRAT produced a box, but V4 held the Kalman prediction instead of committing the suspicious output.

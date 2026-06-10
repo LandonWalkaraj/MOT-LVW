@@ -4,6 +4,7 @@ import argparse
 import copy
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,14 +19,14 @@ Color = Tuple[int, int, int]
 VideoSource = Union[int, str]
 
 # ---------------------------------------------------------------------------
-# V4 editable defaults and shared data models
+# V5 editable defaults and shared data models
 # ---------------------------------------------------------------------------
 
-# Edit this block when tuning V4. The VS Code V4 launch profile intentionally
-# avoids passing these knobs so these constants remain the default source of truth.
+# Edit this block when tuning V5. Launch profiles should avoid passing these
+# knobs so these constants remain the default source of truth.
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "lorat-gui-v4"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "lorat-gui-v5"
 DEFAULT_DEBUG_DIR = PROJECT_ROOT / "outputs" / "debug"
 DEFAULT_LORAT_ROOT = PROJECT_ROOT / "external" / "LoRAT-main"
 DEFAULT_DANCETRACK_SEQUENCE = PROJECT_ROOT / "data" / "raw" / "DanceTrack" / "val" / "val" / "dancetrack0065"
@@ -34,19 +35,28 @@ DEFAULT_LORAT_WINDOW_PENALTY = 0.60
 DEFAULT_LORAT_STATE_UPDATE_MIN_SCORE = 0.30
 DEFAULT_LORAT_STATE_UPDATE_MAX_CENTER_SHIFT = 0.85
 DEFAULT_LORAT_STATE_UPDATE_MAX_AREA_CHANGE = 1.80
-DEFAULT_LORAT_MEMORY_SLOTS = 11
+DEFAULT_LORAT_MEMORY_SLOTS = 5
 DEFAULT_LORAT_MEMORY_REFRESH_INTERVAL = 1
-DEFAULT_LORAT_ACTIVE_SLOTS_PER_TRACK = 10
+DEFAULT_LORAT_ACTIVE_SLOTS_PER_TRACK = 5
 DEFAULT_LORAT_FIXED_BOX_SIZE = False
-DEFAULT_LORAT_MIN_BOX_AREA = 100.0
+DEFAULT_LORAT_MIN_BOX_AREA = 1.0
 DEFAULT_LORAT_MAX_AREA_CHANGE_PER_FRAME = 1.05
-DEFAULT_LORAT_TRUSTED_SIZE_FLOOR_SCALE = 0.70
+DEFAULT_LORAT_TRUSTED_SIZE_FLOOR_SCALE = 0.30
 DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE = 12
 DEFAULT_LORAT_ACCEPT_MIN_SCORE = 0.20
+DEFAULT_SHRINK_GUARD_WINDOW = 6
+DEFAULT_SHRINK_GUARD_AREA_RATIO = 0.72
+DEFAULT_SHRINK_GUARD_STEP_RATIO = 0.94
+DEFAULT_SHRINK_GUARD_MIN_CONFIDENCE = 0.70
+DEFAULT_SHRINK_GUARD_MIN_REID = 0.50
+DEFAULT_CROP_INFORMATION_MIN_SCORE = 0.12
+DEFAULT_CROP_INFORMATION_MIN_PIXELS = 64
 DEFAULT_IDENTITY_MIN_SCORE = 0.50
 DEFAULT_IDENTITY_MIN_REID = 0.28
 DEFAULT_IDENTITY_MIN_MOTION = 0.18
 DEFAULT_IDENTITY_MIN_PATH = 0.40
+DEFAULT_PATH_GATE_MIN_RELIABLE_POINTS = 10
+DEFAULT_PATH_GATE_MIN_FRAME_SPAN = 10
 DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_IOU = 0.18
 DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_OTHER = 0.68
 DEFAULT_IDENTITY_ANCHOR_STEAL_MARGIN = 0.06
@@ -62,6 +72,7 @@ DEFAULT_PATH_RECOVERY_AFTER_FRAMES = 2
 DEFAULT_PATH_RECOVERY_MIN_CONFIDENCE = 0.45
 DEFAULT_PATH_RECOVERY_MIN_REID = 0.72
 DEFAULT_PATH_RECOVERY_MIN_MOTION = 0.55
+DEFAULT_RECOVERY_INITIAL_ANCHOR_MIN = 0.0
 DEFAULT_IDENTITY_MEMORY_MIN_CONFIDENCE = 0.55
 DEFAULT_OCCLUSION_MAX_FRAMES = 30
 DEFAULT_OCCLUSION_IOU_THRESHOLD = 0.28
@@ -75,6 +86,7 @@ DEFAULT_VIEW_CHANGE_MIN_MOTION = 0.60
 DEFAULT_VIEW_CHANGE_MIN_CONFIDENCE = 0.16
 DEFAULT_VIEW_CHANGE_MAX_LOST_FRAMES = 2
 MAX_LORAT_MEMORY_SLOTS = 16
+V5_EXECUTION_MODE = "shared-backbone"
 
 LORAT_WEIGHT_BY_CONFIG = {
     "B-224": PROJECT_ROOT / "models" / "lorat" / "base.bin",
@@ -130,6 +142,16 @@ class TrackState:
     occluded_frames: int = 0
     last_reliable_bbox: Optional[BBox] = None
     last_reliable_frame: int = 0
+    size_history: List[Tuple[int, BBox]] = field(default_factory=list)
+    shrink_risk_frames: int = 0
+    learning_held_frames: int = 0
+    learning_block_reason: str = ""
+    last_area_ratio: Optional[float] = None
+    last_window_area_ratio: Optional[float] = None
+    last_crop_info_score: Optional[float] = None
+    last_crop_edge_density: Optional[float] = None
+    last_crop_laplacian_var: Optional[float] = None
+    last_crop_contrast: Optional[float] = None
 
 
 @dataclass
@@ -156,6 +178,48 @@ class LoRATSlotOutput:
     bbox: BBox
     confidence: Optional[float]
     appearance_hist: Optional[np.ndarray] = None
+
+
+@dataclass
+class RuntimeStatus:
+    fps: float = 0.0
+    last_frame_seconds: float = 0.0
+    active_objects: int = 0
+    evaluator_calls: int = 0
+    evaluator_tasks: int = 0
+    max_evaluator_batch: int = 0
+    model_forward_calls: int = 0
+    model_forward_items: int = 0
+    max_model_forward_batch: int = 0
+    fusion_forward_calls: int = 0
+    fusion_forward_items: int = 0
+    max_fusion_forward_batch: int = 0
+    gpu_name: str = ""
+    gpu_allocated_mb: Optional[float] = None
+    gpu_reserved_mb: Optional[float] = None
+    gpu_peak_allocated_mb: Optional[float] = None
+    gpu_peak_reserved_mb: Optional[float] = None
+    gating_decisions: int = 0
+    gating_primary_decisions: int = 0
+    gating_recovery_decisions: int = 0
+    gating_selected_slot_items: int = 0
+    gating_avg_slots_per_decision: float = 0.0
+    gating_recovery_reasons: str = ""
+    shared_frame_backbone_calls: int = 0
+    shared_frame_backbone_items: int = 0
+    object_head_batches: int = 0
+    object_head_items: int = 0
+    max_object_head_batch: int = 0
+    object_head_roi_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class CropInformation:
+    score: float = 0.0
+    edge_density: float = 0.0
+    laplacian_var: float = 0.0
+    contrast: float = 0.0
+    pixel_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -555,11 +619,11 @@ class LightweightIdentityArbitrator:
 
 
 # ---------------------------------------------------------------------------
-# V4 LoRAT-backed MOT engine
+# V5 LoRAT-backed MOT engine
 # ---------------------------------------------------------------------------
 
 class LoRATMultiObjectTracker:
-    backend_name = "LoRAT-v4"
+    backend_name = "LoRAT-v5-shared"
 
     def __init__(
         self,
@@ -582,6 +646,13 @@ class LoRATMultiObjectTracker:
         lorat_trusted_size_floor_scale: float = DEFAULT_LORAT_TRUSTED_SIZE_FLOOR_SCALE,
         lorat_memory_min_score: float = 0.55,
         lorat_accept_min_score: float = DEFAULT_LORAT_ACCEPT_MIN_SCORE,
+        shrink_guard_window: int = DEFAULT_SHRINK_GUARD_WINDOW,
+        shrink_guard_area_ratio: float = DEFAULT_SHRINK_GUARD_AREA_RATIO,
+        shrink_guard_step_ratio: float = DEFAULT_SHRINK_GUARD_STEP_RATIO,
+        shrink_guard_min_confidence: float = DEFAULT_SHRINK_GUARD_MIN_CONFIDENCE,
+        shrink_guard_min_reid: float = DEFAULT_SHRINK_GUARD_MIN_REID,
+        crop_information_min_score: float = DEFAULT_CROP_INFORMATION_MIN_SCORE,
+        crop_information_min_pixels: int = DEFAULT_CROP_INFORMATION_MIN_PIXELS,
         lorat_slot_capacity: int = 0,
         expected_tracks: int = 0,
         lorat_search_area_factor: Optional[float] = DEFAULT_LORAT_SEARCH_AREA_FACTOR,
@@ -628,6 +699,13 @@ class LoRATMultiObjectTracker:
         self.lorat_trusted_size_floor_scale = max(0.0, min(1.0, lorat_trusted_size_floor_scale))
         self.lorat_memory_min_score = max(0.0, lorat_memory_min_score)
         self.lorat_accept_min_score = max(0.0, min(1.0, float(lorat_accept_min_score)))
+        self.shrink_guard_window = max(0, int(shrink_guard_window))
+        self.shrink_guard_area_ratio = max(0.0, min(1.0, float(shrink_guard_area_ratio)))
+        self.shrink_guard_step_ratio = max(0.0, min(1.0, float(shrink_guard_step_ratio)))
+        self.shrink_guard_min_confidence = max(0.0, min(1.0, float(shrink_guard_min_confidence)))
+        self.shrink_guard_min_reid = max(0.0, min(1.0, float(shrink_guard_min_reid)))
+        self.crop_information_min_score = max(0.0, float(crop_information_min_score))
+        self.crop_information_min_pixels = max(1, int(crop_information_min_pixels))
         self.occlusion_max_frames = max(0, int(occlusion_max_frames))
         self.occlusion_iou_threshold = max(0.0, min(1.0, float(occlusion_iou_threshold)))
         self.occlusion_velocity_damping = max(0.0, min(1.0, float(occlusion_velocity_damping)))
@@ -678,11 +756,16 @@ class LoRATMultiObjectTracker:
         self.track_by_id: Dict[int, TrackState] = {}
         self.lorat_slots_by_task_id: Dict[int, LoRATMemorySlot] = {}
         self.lorat_slots_by_track_id: Dict[int, List[int]] = {}
+        self.slot_debug_lines: List[str] = []
         self.next_track_id = 1
         self.next_lorat_task_id = 1
         self.closed = False
         self.using_directml = False
         self.device_label = self.device_string
+        self.gpu_name = ""
+        self.runtime_status = RuntimeStatus()
+        self._fps_smoothing = 0.15
+        self.backend_name = "LoRAT-v5-shared"
 
         self._load_lorat()
         self._build_runtime()
@@ -734,6 +817,13 @@ class LoRATMultiObjectTracker:
                 "LoRAT was asked to use cuda, but this PyTorch build reports no CUDA/HIP device. "
                 "Use --device cpu on this laptop, or install a working CUDA/ROCm PyTorch build."
             )
+        if self.device.type == "cuda":
+            self.gpu_name = torch.cuda.get_device_name(self.device)
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(self.device)
+        elif self.using_directml:
+            self.gpu_name = self.device_label
+        self.runtime_status.gpu_name = self.gpu_name
 
     def _build_runtime(self) -> None:
         try:
@@ -794,6 +884,7 @@ class LoRATMultiObjectTracker:
             self.track_batch_size,
             1,
         )
+        self._install_lorat_forward_profile()
 
         pipeline_config = config["run"]["runner"]["test"]["evaluator"]["pipeline"]
         pipeline = build_tracker_evaluator_pipeline(
@@ -815,17 +906,79 @@ class LoRATMultiObjectTracker:
         print(
             f"Loaded LoRAT {self.config_name} on {self.device_label} with weight {self.weight_path.name}. "
             f"Track batch size: {self.track_batch_size}; LoRAT slot capacity: {self.lorat_slot_capacity}; "
+            f"execution mode: {V5_EXECUTION_MODE}; "
             f"active slots/track: {'all' if self.lorat_active_slots_per_track == 0 else self.lorat_active_slots_per_track}; "
             f"fixed box size: {self.lorat_fixed_box_size}; "
             f"min box area: {self.lorat_min_box_area:.1f}; "
             f"max area change/frame: {self.lorat_max_area_change_per_frame:.2f}; "
             f"size floor scale: {self.lorat_trusted_size_floor_scale:.2f}; "
+            f"shrink guard: window={self.shrink_guard_window}, area_ratio={self.shrink_guard_area_ratio:.2f}, "
+            f"step_ratio={self.shrink_guard_step_ratio:.2f}; "
+            f"crop info min: {self.crop_information_min_score:.2f}/{self.crop_information_min_pixels}px; "
             f"accept score: {self.lorat_accept_min_score:.2f}; "
             f"occlusion hold: {self.occlusion_max_frames} frames; "
             f"occlusion velocity damping: {self.occlusion_velocity_damping:.2f}"
         )
         if self.lorat_runtime_overrides:
             print("LoRAT runtime overrides: " + "; ".join(self.lorat_runtime_overrides))
+
+    @staticmethod
+    def _tensor_batch_size(value: object) -> Optional[int]:
+        shape = getattr(value, "shape", None)
+        if shape is None or len(shape) == 0:
+            return None
+        try:
+            return int(shape[0])
+        except (TypeError, ValueError):
+            return None
+
+    def _forward_batch_size(self, args: Sequence[object], kwargs: Dict[str, object]) -> int:
+        for key in ("z", "x", "z_feat", "x_feat"):
+            if key in kwargs:
+                batch_size = self._tensor_batch_size(kwargs[key])
+                if batch_size is not None:
+                    return batch_size
+        for value in args:
+            batch_size = self._tensor_batch_size(value)
+            if batch_size is not None:
+                return batch_size
+        return 0
+
+    def _install_lorat_forward_profile(self) -> None:
+        raw_model = getattr(self.optimized_model, "raw_model", None)
+        if raw_model is None or getattr(raw_model, "_v5_forward_profile_installed", False):
+            return
+
+        original_forward = raw_model.forward
+
+        def profiled_forward(*args, **kwargs):
+            batch_size = self._forward_batch_size(args, kwargs)
+            self.runtime_status.model_forward_calls += 1
+            self.runtime_status.model_forward_items += batch_size
+            self.runtime_status.max_model_forward_batch = max(
+                self.runtime_status.max_model_forward_batch,
+                batch_size,
+            )
+            return original_forward(*args, **kwargs)
+
+        raw_model.forward = profiled_forward
+
+        if hasattr(raw_model, "_fusion"):
+            original_fusion = raw_model._fusion
+
+            def profiled_fusion(*args, **kwargs):
+                batch_size = self._forward_batch_size(args, kwargs)
+                self.runtime_status.fusion_forward_calls += 1
+                self.runtime_status.fusion_forward_items += batch_size
+                self.runtime_status.max_fusion_forward_batch = max(
+                    self.runtime_status.max_fusion_forward_batch,
+                    batch_size,
+                )
+                return original_fusion(*args, **kwargs)
+
+            raw_model._fusion = profiled_fusion
+
+        raw_model._v5_forward_profile_installed = True
 
     def _apply_lorat_runtime_overrides(self, config: dict) -> None:
         pipeline_config = config["run"]["runner"]["test"]["evaluator"]["pipeline"]
@@ -1070,6 +1223,8 @@ class LoRATMultiObjectTracker:
     def _should_refresh_lorat_memory_slot(self, track: TrackState, frame_number: int) -> bool:
         if self.lorat_memory_slots <= 1:
             return False
+        if track.learning_block_reason:
+            return False
         if track.confidence is not None and track.confidence < self.lorat_memory_min_score:
             return False
         if track.assignment_score is not None and track.assignment_score < self.identity_arbitrator.min_score:
@@ -1092,6 +1247,59 @@ class LoRATMultiObjectTracker:
         track.trusted_size_bank.append(clamp_bbox_size(bbox))
         if len(track.trusted_size_bank) > DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE:
             del track.trusted_size_bank[: len(track.trusted_size_bank) - DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE]
+
+    def _record_size_history(self, track: TrackState, frame_number: int, bbox: BBox) -> None:
+        track.size_history.append((frame_number, clamp_bbox_size(bbox)))
+        max_history = max(DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE, self.shrink_guard_window + 2)
+        if len(track.size_history) > max_history:
+            del track.size_history[: len(track.size_history) - max_history]
+
+    def _learning_evidence_is_strong(
+        self,
+        track: TrackState,
+        confidence: Optional[float],
+        identity_assignment: Optional[IdentityAssignment],
+    ) -> bool:
+        confidence_value = 0.5 if confidence is None else max(0.0, min(1.0, float(confidence)))
+        if confidence_value < self.shrink_guard_min_confidence:
+            return False
+        if identity_assignment is None or not track_has_appearance(track):
+            return True
+        return identity_assignment.score.appearance >= self.shrink_guard_min_reid
+
+    def _assess_learning_hold(
+        self,
+        track: TrackState,
+        bbox: BBox,
+        confidence: Optional[float],
+        identity_assignment: Optional[IdentityAssignment],
+        frame: Optional[np.ndarray],
+    ) -> Tuple[bool, List[str], CropInformation, float, float, int]:
+        crop_info = measure_crop_information(frame, bbox, self.crop_information_min_pixels)
+        previous_area = bbox_area(track.bbox)
+        current_area = bbox_area(bbox)
+        step_ratio = current_area / max(1.0, previous_area)
+
+        recent_history = track.size_history[-self.shrink_guard_window :] if self.shrink_guard_window > 0 else []
+        reference_area = max([previous_area] + [bbox_area(sample_bbox) for _, sample_bbox in recent_history])
+        window_ratio = current_area / max(1.0, reference_area)
+
+        projected_shrink_frames = track.shrink_risk_frames + 1 if step_ratio < 0.995 else 0
+        shrink_reasons: List[str] = []
+        if self.shrink_guard_step_ratio > 0 and step_ratio < self.shrink_guard_step_ratio:
+            shrink_reasons.append("SHRINKSTEP")
+        if self.shrink_guard_area_ratio > 0 and window_ratio < self.shrink_guard_area_ratio:
+            shrink_reasons.append("SHRINKWINDOW")
+        if projected_shrink_frames >= 3 and window_ratio < 0.90:
+            shrink_reasons.append("SHRINKRATCHET")
+
+        reasons: List[str] = []
+        if crop_info.score < self.crop_information_min_score:
+            reasons.append("LOWINFO")
+        if shrink_reasons and not self._learning_evidence_is_strong(track, confidence, identity_assignment):
+            reasons.append("SHRINKRISK")
+
+        return bool(reasons), reasons, crop_info, step_ratio, window_ratio, projected_shrink_frames
 
     def _trusted_size_floor(self, track: TrackState) -> Optional[Tuple[float, float]]:
         if self.lorat_trusted_size_floor_scale <= 0:
@@ -1300,10 +1508,12 @@ class LoRATMultiObjectTracker:
             identity_assignment.output,
             score,
         )
+        if track.lost_frames > 0 and not self._has_recovery_initial_anchor(identity_assignment):
+            return "ANCHORLOW"
         if self._is_initial_anchor_steal(score):
             return "OTHERID"
         if (
-            reliable_path_point_count(track) >= 3
+            path_gate_ready(track)
             and score.path < self.identity_arbitrator.min_path
             and confidence_value < 0.85
             and not is_view_change
@@ -1348,9 +1558,17 @@ class LoRATMultiObjectTracker:
             identity_assignment.output.source_track_id == track.track_id
             and confidence_value >= DEFAULT_PATH_RECOVERY_MIN_CONFIDENCE
             and score.appearance >= DEFAULT_PATH_RECOVERY_MIN_REID
+            and self._has_recovery_initial_anchor(identity_assignment)
             and score.motion >= DEFAULT_PATH_RECOVERY_MIN_MOTION
             and score.total >= self.identity_arbitrator.min_score
         )
+
+    def _has_recovery_initial_anchor(self, identity_assignment: Optional[IdentityAssignment]) -> bool:
+        if DEFAULT_RECOVERY_INITIAL_ANCHOR_MIN <= 0:
+            return True
+        if identity_assignment is None:
+            return False
+        return identity_assignment.score.initial_anchor >= DEFAULT_RECOVERY_INITIAL_ANCHOR_MIN
 
     def _is_reid_recovery(
         self,
@@ -1365,6 +1583,7 @@ class LoRATMultiObjectTracker:
             confidence_value >= self.reid_recovery_min_confidence
             and score.total >= self.reid_recovery_min_score
             and score.appearance >= self.reid_recovery_min_reid
+            and self._has_recovery_initial_anchor(identity_assignment)
             and score.motion >= self.reid_recovery_min_motion
             and (
                 score.path >= self.identity_arbitrator.min_path
@@ -1443,6 +1662,7 @@ class LoRATMultiObjectTracker:
             )
             track.initial_bbox = track.bbox
             self._commit_trusted_size(track, track.bbox)
+            self._record_size_history(track, frame_number, track.bbox)
             self.tracks.append(track)
             self.track_by_id[track_id] = track
             added_tracks.append(track)
@@ -1474,8 +1694,10 @@ class LoRATMultiObjectTracker:
             SiameseTrackerEvalDataWorker_Task,
         )
 
+        update_started = time.perf_counter()
         active_tracks = [track for track in self.tracks if self._get_track_slots(track)]
         if not active_tracks:
+            self._record_frame_status(time.perf_counter() - update_started)
             return self.tracks
         self._predict_active_tracks(active_tracks, frame)
 
@@ -1505,6 +1727,7 @@ class LoRATMultiObjectTracker:
 
         outputs = self._run_worker_tasks(tasks)
         self._apply_evaluated_frames(outputs, frame, frame_number)
+        self._record_frame_status(time.perf_counter() - update_started)
         return self.tracks
 
     def _apply_evaluated_frames(
@@ -1558,7 +1781,12 @@ class LoRATMultiObjectTracker:
             for track_id, outputs_for_track in slot_outputs.items()
             for slot, bbox, confidence in outputs_for_track
         ]
-        assignments = self.identity_arbitrator.resolve(evaluated_tracks, candidate_outputs, frame)
+        prepared_candidate_outputs = [
+            self.identity_arbitrator._with_appearance(output, frame)
+            for output in candidate_outputs
+        ]
+        self._append_slot_debug_rows(frame_number, evaluated_tracks, prepared_candidate_outputs)
+        assignments = self.identity_arbitrator.resolve(evaluated_tracks, prepared_candidate_outputs, frame)
         assigned_track_ids = set()
         assigned_output_keys = {
             (assignment.output.source_track_id, assignment.output.slot.task_id)
@@ -1634,6 +1862,51 @@ class LoRATMultiObjectTracker:
             refresh_tasks = self._build_lorat_memory_refresh_tasks(updated_tracks, frame, frame_number)
             if refresh_tasks:
                 self._run_worker_tasks(refresh_tasks)
+
+    def _append_slot_debug_rows(
+        self,
+        frame_number: int,
+        evaluated_tracks: Sequence[TrackState],
+        candidate_outputs: Sequence[LoRATSlotOutput],
+    ) -> None:
+        for output in candidate_outputs:
+            track = self.track_by_id.get(output.source_track_id)
+            if track is None:
+                continue
+            score = self.identity_arbitrator.score(track, output, evaluated_tracks)
+            calibrated_confidence = preview_lorat_confidence(track, output.slot, output.confidence)
+            fields = [
+                str(frame_number),
+                str(track.track_id),
+                csv_text(output.slot.label),
+                str(output.slot.task_id),
+                str(output.slot.frame_number),
+                str(output.slot.anchor_frame_number),
+                str(output.slot.last_refresh_frame),
+                "1" if output.slot.active else "0",
+                csv_text(track.active_lorat_slot),
+                csv_float(output.confidence),
+                csv_float(calibrated_confidence),
+                csv_float(output.slot.confidence_baseline),
+                csv_float(track.confidence_baseline),
+                *csv_bbox(output.bbox),
+                *csv_bbox(track.bbox),
+                *csv_bbox(track.predicted_bbox),
+                csv_float(score.total),
+                csv_float(score.appearance),
+                csv_float(score.motion),
+                csv_float(score.path),
+                csv_float(score.source),
+                csv_float(score.confidence),
+                csv_float(score.iou),
+                csv_float(score.initial_anchor),
+                csv_float(score.other_anchor),
+                str(score.other_track_id) if score.other_track_id is not None else "",
+                csv_float(score.identity_margin),
+                str(score.occlusion_track_id) if score.occlusion_track_id is not None else "",
+                csv_float(score.occlusion_iou),
+            ]
+            self.slot_debug_lines.append(",".join(fields) + "\n")
 
     def _best_owned_fallback_assignment(
         self,
@@ -1723,6 +1996,20 @@ class LoRATMultiObjectTracker:
                 track.occlusion_iou = identity_assignment.score.occlusion_iou
             return False
 
+        (
+            learning_held,
+            learning_hold_reasons,
+            crop_info,
+            area_ratio,
+            window_area_ratio,
+            projected_shrink_frames,
+        ) = self._assess_learning_hold(
+            track,
+            accepted_bbox,
+            calibrated_confidence,
+            identity_assignment,
+            frame,
+        )
         occlusion_track_id, occlusion_iou = self._candidate_occlusion_info(track, accepted_bbox)
         candidate_occluded = occlusion_track_id is not None
         previous = track.bbox
@@ -1737,6 +2024,15 @@ class LoRATMultiObjectTracker:
         track.occluded_frames = track.occluded_frames + 1 if candidate_occluded else 0
         track.occlusion_track_id = occlusion_track_id
         track.occlusion_iou = occlusion_iou
+        track.shrink_risk_frames = projected_shrink_frames
+        track.learning_held_frames = track.learning_held_frames + 1 if learning_held else 0
+        track.learning_block_reason = ",".join(learning_hold_reasons) if learning_held else ""
+        track.last_area_ratio = area_ratio
+        track.last_window_area_ratio = window_area_ratio
+        track.last_crop_info_score = crop_info.score
+        track.last_crop_edge_density = crop_info.edge_density
+        track.last_crop_laplacian_var = crop_info.laplacian_var
+        track.last_crop_contrast = crop_info.contrast
         state_prefix = "LORAT" if slot.label == "initial" else f"LORAT-{slot.label.upper()}"
         if identity_assignment is not None and identity_assignment.output.source_track_id != track.track_id:
             state_prefix = f"REID-{state_prefix}"
@@ -1761,6 +2057,10 @@ class LoRATMultiObjectTracker:
             state_prefix = append_state_token(state_prefix, "REIDRECOVERY")
         if candidate_occluded:
             state_prefix = append_state_token(state_prefix, "OCCLUSION")
+        if learning_held:
+            state_prefix = append_state_token(state_prefix, "NOLEARN")
+            for reason in learning_hold_reasons:
+                state_prefix = append_state_token(state_prefix, reason)
         track.state = state_prefix
         track.active_lorat_slot = slot.label
         track.active_template_frame = slot.frame_number
@@ -1780,7 +2080,7 @@ class LoRATMultiObjectTracker:
             track.identity_margin = identity_assignment.score.identity_margin
             track.occlusion_track_id = identity_assignment.score.occlusion_track_id
             track.occlusion_iou = identity_assignment.score.occlusion_iou
-            if not candidate_occluded:
+            if not candidate_occluded and not learning_held:
                 self.identity_arbitrator.commit_track_memory(
                     track,
                     identity_assignment.output,
@@ -1790,12 +2090,13 @@ class LoRATMultiObjectTracker:
         if track.kalman is None:
             track.kalman = BBoxKalmanFilter(accepted_bbox)
         track.kalman.update(accepted_bbox, calibrated_confidence)
-        if not candidate_occluded:
+        if not candidate_occluded and not learning_held:
             self._update_confidence_baseline(track, slot, raw_confidence)
             track.last_reliable_bbox = accepted_bbox
             track.last_reliable_frame = frame_number
             record_reliable_track_trajectory(track, frame_number, accepted_bbox, self.trajectory_history_size)
-        self._commit_trusted_size(track, accepted_bbox)
+            self._commit_trusted_size(track, accepted_bbox)
+        self._record_size_history(track, frame_number, accepted_bbox)
         record_track_trajectory(track, frame_number, accepted_bbox, self.trajectory_history_size)
         return True
 
@@ -1852,6 +2153,10 @@ class LoRATMultiObjectTracker:
 
         merged_outputs = {"evaluated_frames": []}
         for task_chunk in chunk_sequence(worker_tasks, self.track_batch_size):
+            task_count = len(task_chunk)
+            self.runtime_status.evaluator_calls += 1
+            self.runtime_status.evaluator_tasks += task_count
+            self.runtime_status.max_evaluator_batch = max(self.runtime_status.max_evaluator_batch, task_count)
             transformed_tasks = tuple(self.transform(task) for task in task_chunk)
             data = TrackerEvalData(transformed_tasks, {})
             outputs = self.evaluator.run(
@@ -1866,7 +2171,60 @@ class LoRATMultiObjectTracker:
                     merged_outputs.setdefault(key, []).extend(value)
                 elif key not in merged_outputs:
                     merged_outputs[key] = value
+            self._update_gpu_memory_status()
         return merged_outputs
+
+    def _record_frame_status(self, elapsed_seconds: float) -> None:
+        self.runtime_status.last_frame_seconds = elapsed_seconds
+        instant_fps = 1.0 / elapsed_seconds if elapsed_seconds > 0 else 0.0
+        if self.runtime_status.fps <= 0:
+            self.runtime_status.fps = instant_fps
+        else:
+            alpha = self._fps_smoothing
+            self.runtime_status.fps = (alpha * instant_fps) + ((1.0 - alpha) * self.runtime_status.fps)
+        self.runtime_status.active_objects = sum(1 for track in self.tracks if track.ok)
+        self._update_gpu_memory_status()
+
+    def _update_gpu_memory_status(self) -> None:
+        if not hasattr(self, "torch"):
+            return
+        if getattr(self, "device", None) is None or self.device.type != "cuda":
+            return
+        allocated = self.torch.cuda.memory_allocated(self.device)
+        reserved = self.torch.cuda.memory_reserved(self.device)
+        peak_allocated = self.torch.cuda.max_memory_allocated(self.device)
+        peak_reserved = self.torch.cuda.max_memory_reserved(self.device)
+        self.runtime_status.gpu_allocated_mb = bytes_to_mb(allocated)
+        self.runtime_status.gpu_reserved_mb = bytes_to_mb(reserved)
+        self.runtime_status.gpu_peak_allocated_mb = bytes_to_mb(peak_allocated)
+        self.runtime_status.gpu_peak_reserved_mb = bytes_to_mb(peak_reserved)
+
+    def runtime_status_snapshot(self) -> RuntimeStatus:
+        self._update_gpu_memory_status()
+        return copy.copy(self.runtime_status)
+
+    def status_lines(self) -> List[str]:
+        status = self.runtime_status_snapshot()
+        memory = "GPU n/a"
+        if status.gpu_reserved_mb is not None:
+            memory = (
+                f"GPU {status.gpu_allocated_mb:.0f}/{status.gpu_reserved_mb:.0f} MB "
+                f"(peak {status.gpu_peak_reserved_mb:.0f} MB)"
+            )
+        lines = [
+            f"FPS {status.fps:.1f} | Objects {status.active_objects} | {memory}",
+            f"Mode {V5_EXECUTION_MODE} | Eval calls {status.evaluator_calls} | max batch {status.max_evaluator_batch}",
+        ]
+        if status.model_forward_calls > 0:
+            lines.append(
+                f"Model forwards {status.model_forward_calls} | max model batch {status.max_model_forward_batch} | "
+                f"max fusion batch {status.max_fusion_forward_batch}"
+            )
+        held_tracks = [track for track in self.tracks if track.learning_block_reason]
+        if held_tracks:
+            reasons = sorted({reason for track in held_tracks for reason in track.learning_block_reason.split(",") if reason})
+            lines.append(f"No-learn {len(held_tracks)} | {','.join(reasons)}")
+        return lines
 
     def close(self) -> None:
         if self.closed:
@@ -1899,7 +2257,7 @@ class LoRATMultiObjectTracker:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Version 4 LoRAT-backed multi-object GUI. Each selected box owns its LoRAT tracker."
+        description="Version 5 LoRAT-backed multi-object GUI with shared batched LoRAT inference."
     )
     parser.add_argument("--video", help="Path to a video file or camera index. Use 0 for webcam.")
     parser.add_argument(
@@ -1929,7 +2287,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_LORAT_MEMORY_SLOTS,
         help=(
             "Internal LoRAT slots per visible track. "
-            "11 means one first-frame anchor plus ten rolling recent LoRAT templates; capped at 16."
+            "5 means one first-frame anchor plus four rolling recent LoRAT templates; capped at 16."
         ),
     )
     parser.add_argument(
@@ -1978,7 +2336,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_LORAT_TRUSTED_SIZE_FLOOR_SCALE,
         help=(
             "Minimum accepted box width/height as a fraction of trusted size memory. "
-            "Default is anchored to the initial selected box; 0 disables the anti-shrink guard."
+            "V5 keeps this permissive by default; 0 disables the geometric floor."
         ),
     )
     parser.add_argument("--lorat-memory-min-score", type=float, default=0.55)
@@ -1990,6 +2348,48 @@ def parse_args() -> argparse.Namespace:
             "Minimum LoRAT confidence required before a box can update the visible track. "
             "Lower-confidence boxes are held with Kalman occlusion prediction instead."
         ),
+    )
+    parser.add_argument(
+        "--shrink-guard-window",
+        type=int,
+        default=DEFAULT_SHRINK_GUARD_WINDOW,
+        help="Recent accepted-box window used to detect cumulative area shrink. 0 disables the window check.",
+    )
+    parser.add_argument(
+        "--shrink-guard-area-ratio",
+        type=float,
+        default=DEFAULT_SHRINK_GUARD_AREA_RATIO,
+        help="Hold learning when current area falls below this ratio of the recent max area unless evidence is strong.",
+    )
+    parser.add_argument(
+        "--shrink-guard-step-ratio",
+        type=float,
+        default=DEFAULT_SHRINK_GUARD_STEP_RATIO,
+        help="Hold learning on a single-frame area shrink below this previous-area ratio unless evidence is strong.",
+    )
+    parser.add_argument(
+        "--shrink-guard-min-confidence",
+        type=float,
+        default=DEFAULT_SHRINK_GUARD_MIN_CONFIDENCE,
+        help="Minimum calibrated LoRAT confidence required to learn from a shrink-risk update.",
+    )
+    parser.add_argument(
+        "--shrink-guard-min-reid",
+        type=float,
+        default=DEFAULT_SHRINK_GUARD_MIN_REID,
+        help="Minimum ReID appearance score required to learn from a shrink-risk update when appearance memory exists.",
+    )
+    parser.add_argument(
+        "--crop-information-min-score",
+        type=float,
+        default=DEFAULT_CROP_INFORMATION_MIN_SCORE,
+        help="Minimum crop information score before an accepted box can refresh template/ReID/size memory.",
+    )
+    parser.add_argument(
+        "--crop-information-min-pixels",
+        type=int,
+        default=DEFAULT_CROP_INFORMATION_MIN_PIXELS,
+        help="Pixel count at which the crop-information score stops being penalized for tiny crops.",
     )
     parser.add_argument(
         "--lorat-search-area-factor",
@@ -2120,10 +2520,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-video",
         type=Path,
-        help="Annotated MP4 output path. Defaults to outputs/lorat-gui-v4/<source>_lorat_v4_annotated.mp4.",
+        help="Annotated MP4 output path. Defaults to outputs/lorat-gui-v5/<source>_lorat_v5_annotated.mp4.",
     )
     parser.add_argument("--no-save-video", action="store_true", help="Disable annotated MP4 writing.")
     parser.add_argument("--debug-log", type=Path, help="Tracking debug CSV output path. Defaults to outputs/debug.")
+    parser.add_argument(
+        "--slot-debug-log",
+        type=Path,
+        help="Per-LoRAT-memory-slot debug CSV output path. Defaults to outputs/debug.",
+    )
+    parser.add_argument("--no-slot-debug-log", action="store_true", help="Disable per-slot LoRAT debug CSV writing.")
     parser.add_argument("--debug-frame-start", type=int, default=0, help="First frame to include in --debug-log; 0 means all.")
     parser.add_argument("--debug-frame-end", type=int, default=0, help="Last frame to include in --debug-log; 0 means all.")
     parser.add_argument("--max-frames", type=int, default=0, help="Optional frame limit for smoke tests.")
@@ -2211,6 +2617,13 @@ def create_backend(args: argparse.Namespace, source: FrameSource, expected_track
         args.lorat_trusted_size_floor_scale,
         args.lorat_memory_min_score,
         args.lorat_accept_min_score,
+        args.shrink_guard_window,
+        args.shrink_guard_area_ratio,
+        args.shrink_guard_step_ratio,
+        args.shrink_guard_min_confidence,
+        args.shrink_guard_min_reid,
+        args.crop_information_min_score,
+        args.crop_information_min_pixels,
         args.lorat_slot_capacity,
         expected_tracks,
         args.lorat_search_area_factor,
@@ -2309,6 +2722,20 @@ def bbox_iou(left: BBox, right: BBox) -> float:
     return 0.0 if union <= 0 else float(intersection / union)
 
 
+def preview_lorat_confidence(
+    track: TrackState,
+    slot: LoRATMemorySlot,
+    raw_confidence: Optional[float],
+) -> Optional[float]:
+    if raw_confidence is None:
+        return None
+    raw_value = max(0.0, min(1.0, float(raw_confidence)))
+    baseline = slot.confidence_baseline or track.confidence_baseline
+    if baseline is None or baseline <= 0:
+        baseline = max(raw_value, 0.05)
+    return max(0.0, min(1.0, raw_value / max(0.05, float(baseline))))
+
+
 def strongest_track_overlap(
     track: TrackState,
     bbox: BBox,
@@ -2335,6 +2762,10 @@ def bbox_diagonal(bbox: BBox) -> float:
 def bbox_area(bbox: BBox) -> float:
     _, _, w, h = bbox
     return max(1.0, float(w) * float(h))
+
+
+def bytes_to_mb(value: float) -> float:
+    return float(value) / (1024.0 * 1024.0)
 
 
 def bbox_aspect_ratio(bbox: BBox) -> float:
@@ -2382,6 +2813,14 @@ def kalman_prediction_reference(track: TrackState) -> BBox:
 
 def reliable_path_point_count(track: TrackState) -> int:
     return len(track.reliable_trajectory)
+
+
+def path_gate_ready(track: TrackState) -> bool:
+    if len(track.reliable_trajectory) < DEFAULT_PATH_GATE_MIN_RELIABLE_POINTS:
+        return False
+    first_frame = int(track.reliable_trajectory[0][0])
+    last_frame = int(track.reliable_trajectory[-1][0])
+    return (last_frame - first_frame) >= DEFAULT_PATH_GATE_MIN_FRAME_SPAN
 
 
 def center_path_affinity(track: TrackState, candidate: BBox) -> float:
@@ -2578,6 +3017,42 @@ def append_state_token(state: str, token: str) -> str:
 
 
 REGION_FEATURE_LENGTH = (12 * 6 * 4) + (8 * 8 * 4) + 16 + 9 + 1 + 12
+
+
+def measure_crop_information(
+    frame: Optional[np.ndarray],
+    bbox: BBox,
+    min_pixels: int = DEFAULT_CROP_INFORMATION_MIN_PIXELS,
+) -> CropInformation:
+    if frame is None:
+        return CropInformation(score=1.0, pixel_count=min_pixels)
+    clipped = clip_bbox_to_frame(frame, bbox)
+    if clipped is None:
+        return CropInformation()
+    x, y, w, h = clipped
+    crop = frame[y : y + h, x : x + w]
+    if crop.size == 0:
+        return CropInformation()
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    pixel_count = int(gray.size)
+    laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var()) if pixel_count > 0 else 0.0
+    edges = cv2.Canny(gray, 80, 160)
+    edge_density = float(np.count_nonzero(edges)) / max(1, pixel_count)
+    contrast = float(gray.std())
+
+    pixel_score = min(1.0, pixel_count / max(1.0, float(min_pixels)))
+    texture_score = min(1.0, laplacian_var / 80.0)
+    edge_score = min(1.0, edge_density / 0.08)
+    contrast_score = min(1.0, contrast / 32.0)
+    score = pixel_score * ((0.50 * texture_score) + (0.35 * edge_score) + (0.15 * contrast_score))
+    return CropInformation(
+        score=max(0.0, min(1.0, float(score))),
+        edge_density=edge_density,
+        laplacian_var=laplacian_var,
+        contrast=contrast,
+        pixel_count=pixel_count,
+    )
 
 
 def extract_reid_histogram(frame: np.ndarray, bbox: BBox) -> Optional[np.ndarray]:
@@ -2937,6 +3412,16 @@ DEBUG_LOG_HEADER = (
 )
 
 
+SLOT_DEBUG_LOG_HEADER = (
+    "frame,track_id,slot_label,slot_task_id,slot_template_frame,slot_anchor_frame,slot_last_refresh_frame,"
+    "slot_active,active_lorat_slot_before,raw_confidence,calibrated_confidence,slot_confidence_baseline,"
+    "track_confidence_baseline,raw_x,raw_y,raw_w,raw_h,track_x,track_y,track_w,track_h,"
+    "pred_x,pred_y,pred_w,pred_h,score_total,reid_score,motion_score,path_score,source_score,"
+    "score_confidence,iou_score,initial_anchor_score,other_anchor_score,other_anchor_track_id,"
+    "identity_margin,occlusion_track_id,occlusion_iou\n"
+)
+
+
 def append_debug_rows(
     lines: List[str],
     frame_number: int,
@@ -2993,6 +3478,11 @@ def write_debug_log(path: Path, lines: Sequence[str]) -> None:
     path.write_text(DEBUG_LOG_HEADER + "".join(lines), encoding="utf-8")
 
 
+def write_slot_debug_log(path: Path, lines: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(SLOT_DEBUG_LOG_HEADER + "".join(lines), encoding="utf-8")
+
+
 def csv_float(value: Optional[float]) -> str:
     if value is None:
         return ""
@@ -3024,11 +3514,18 @@ def draw_tracks(
     tracks: Sequence[TrackState],
     frame_number: int,
     backend_label: str,
+    status_lines: Optional[Sequence[str]] = None,
 ) -> np.ndarray:
     output = frame.copy()
     header = f"Frame {frame_number} | {backend_label} | q quit | a add boxes | p pause"
     cv2.putText(output, header, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 3, cv2.LINE_AA)
     cv2.putText(output, header, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (20, 20, 20), 1, cv2.LINE_AA)
+    if status_lines:
+        y = 56
+        for line in status_lines:
+            cv2.putText(output, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 3, cv2.LINE_AA)
+            cv2.putText(output, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
+            y += 22
 
     for track in tracks:
         x, y, w, h = [int(round(value)) for value in track.bbox]
@@ -3055,6 +3552,11 @@ def default_debug_log_path(source_name: str, backend: str) -> Path:
     return DEFAULT_DEBUG_DIR / f"{safe_name}_{backend}_debug.csv"
 
 
+def default_slot_debug_log_path(source_name: str, backend: str) -> Path:
+    safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in source_name)
+    return DEFAULT_DEBUG_DIR / f"{safe_name}_{backend}_slot_debug.csv"
+
+
 def default_video_path(source_name: str, backend: str) -> Path:
     safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in source_name)
     return DEFAULT_OUTPUT_DIR / f"{safe_name}_{backend}_annotated.mp4"
@@ -3073,9 +3575,14 @@ def make_video_writer(path: Path, fps: float, frame: np.ndarray):
 def main() -> int:
     args = parse_args()
     frame_source = open_frame_source(args)
-    output_path = args.output or default_output_path(frame_source.name, "lorat_v4")
-    debug_log_path = args.debug_log or default_debug_log_path(frame_source.name, "lorat_v4")
-    save_video_path = None if args.no_save_video else (args.save_video or default_video_path(frame_source.name, "lorat_v4"))
+    output_path = args.output or default_output_path(frame_source.name, "lorat_v5")
+    debug_log_path = args.debug_log or default_debug_log_path(frame_source.name, "lorat_v5")
+    slot_debug_log_path = (
+        None
+        if args.no_slot_debug_log
+        else (args.slot_debug_log or default_slot_debug_log_path(frame_source.name, "lorat_v5"))
+    )
+    save_video_path = None if args.no_save_video else (args.save_video or default_video_path(frame_source.name, "lorat_v5"))
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     ok, first_frame = frame_source.read()
@@ -3106,6 +3613,9 @@ def main() -> int:
         print(f"Wrote MOTChallenge-format tracks to: {output_path}")
         write_debug_log(debug_log_path, debug_lines)
         print(f"Wrote debug CSV to: {debug_log_path}")
+        if slot_debug_log_path is not None:
+            write_slot_debug_log(slot_debug_log_path, backend.slot_debug_lines)
+            print(f"Wrote LoRAT slot debug CSV to: {slot_debug_log_path}")
         outputs_written = True
 
     try:
@@ -3113,7 +3623,7 @@ def main() -> int:
         append_mot_results(mot_lines, frame_number, backend.tracks)
         append_debug_rows(debug_lines, frame_number, backend.tracks, args.debug_frame_start, args.debug_frame_end)
         if writer is not None:
-            writer.write(draw_tracks(first_frame, backend.tracks, frame_number, backend.backend_name))
+            writer.write(draw_tracks(first_frame, backend.tracks, frame_number, backend.backend_name, backend.status_lines()))
 
         while True:
             if not paused:
@@ -3128,11 +3638,11 @@ def main() -> int:
             else:
                 frame = frame.copy()
 
-            shown = draw_tracks(frame, backend.tracks, frame_number, backend.backend_name)
+            shown = draw_tracks(frame, backend.tracks, frame_number, backend.backend_name, backend.status_lines())
             if writer is not None and not paused:
                 writer.write(shown)
 
-            cv2.imshow("LoRAT Multi-Object Tracker v4", shown)
+            cv2.imshow("LoRAT Multi-Object Tracker v5", shown)
             key = cv2.waitKey(30 if not paused else 0) & 0xFF
             if key == ord("q"):
                 break
