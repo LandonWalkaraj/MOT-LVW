@@ -22,7 +22,7 @@ BUNDLE="${BUNDLE:-/work/$USER/theia_lorat_v8_train_bundle.tar.gz}"
 UPDATE_ROOT="${UPDATE_ROOT:-/work/$USER/lorat-v8-live-updates}"
 RUN_ROOT="${RUN_ROOT:-/work/$USER/lorat-v8-train-job-$SLURM_JOB_ID}"
 RESULT_ROOT="${RESULT_ROOT:-/work/$USER/lorat-v8-train-results}"
-VENV_DIR="${VENV_DIR:-/work/$USER/lorat-v8-venv-cu128}"
+VENV_DIR="${VENV_DIR:-/work/$USER/lorat-v8-venv-cu128-$SLURM_JOB_ID}"
 PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 PIP_CACHE_DIR="${PIP_CACHE_DIR:-/work/$USER/.cache/pip}"
 EXPECT_GPU_NAME="${EXPECT_GPU_NAME:-A100}"
@@ -40,6 +40,9 @@ SEARCH_AREA_FACTOR="${SEARCH_AREA_FACTOR:-4.0}"
 SEARCH_SCALE_JITTER="${SEARCH_SCALE_JITTER:-0.25}"
 SEARCH_TRANSLATION_JITTER="${SEARCH_TRANSLATION_JITTER:-3.0}"
 SEARCH_MIN_OBJECT_SIZE="${SEARCH_MIN_OBJECT_SIZE:-10.0}"
+SEARCH_ANCHOR_MODE="${SEARCH_ANCHOR_MODE:-current}"
+REPAIR_SEARCH_TO_TARGET="${REPAIR_SEARCH_TO_TARGET:-1}"
+SEARCH_TARGET_PADDING_FRACTION="${SEARCH_TARGET_PADDING_FRACTION:-0.05}"
 TEMPLATE_SAMPLING="${TEMPLATE_SAMPLING:-mixed}"
 PREVIOUS_BOX_JITTER="${PREVIOUS_BOX_JITTER:-0.10}"
 SEQUENCE_WINDOW_LENGTH="${SEQUENCE_WINDOW_LENGTH:-5}"
@@ -58,11 +61,14 @@ LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 BOX_LOSS_WEIGHT="${BOX_LOSS_WEIGHT:-1.0}"
 LTRB_LOSS_WEIGHT="${LTRB_LOSS_WEIGHT:-1.0}"
-REID_LOSS_WEIGHT="${REID_LOSS_WEIGHT:-0.25}"
+REID_LOSS_WEIGHT="${REID_LOSS_WEIGHT:-0.50}"
 CENTER_POSITIVE_WEIGHT="${CENTER_POSITIVE_WEIGHT:-0.5}"
 NEGATIVE_LOSS_WEIGHT="${NEGATIVE_LOSS_WEIGHT:-1.0}"
-HARD_NEGATIVE_LOSS_WEIGHT="${HARD_NEGATIVE_LOSS_WEIGHT:-2.0}"
+HARD_NEGATIVE_LOSS_WEIGHT="${HARD_NEGATIVE_LOSS_WEIGHT:-3.0}"
 FOCAL_LOSS_GAMMA="${FOCAL_LOSS_GAMMA:-2.0}"
+DCFST_DISCRIMINATION_WEIGHT="${DCFST_DISCRIMINATION_WEIGHT:-0.70}"
+DCFST_NEGATIVE_CANDIDATES="${DCFST_NEGATIVE_CANDIDATES:-48}"
+DCFST_MARGIN="${DCFST_MARGIN:-0.35}"
 IOU_AWARE_WARMUP_STEPS="${IOU_AWARE_WARMUP_STEPS:-250}"
 GAUSSIAN_SIGMA="${GAUSSIAN_SIGMA:-1.25}"
 CLIP_MAX_NORM="${CLIP_MAX_NORM:-1.0}"
@@ -70,6 +76,11 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-250}"
 TRAIN_DIAGNOSTIC_SAMPLES="${TRAIN_DIAGNOSTIC_SAMPLES:-64}"
 OVERFIT_SMOKE="${OVERFIT_SMOKE:-0}"
 OVERFIT_SMOKE_SAMPLES="${OVERFIT_SMOKE_SAMPLES:-16}"
+OVERFIT_SINGLE_OBJECT="${OVERFIT_SINGLE_OBJECT:-0}"
+DEBUG_SEQUENCE_NAME="${DEBUG_SEQUENCE_NAME:-}"
+DEBUG_TRACK_ID="${DEBUG_TRACK_ID:-}"
+DEBUG_VISUAL_SAMPLES="${DEBUG_VISUAL_SAMPLES:-24}"
+DEBUG_VISUAL_EVERY_EPOCH="${DEBUG_VISUAL_EVERY_EPOCH:-0}"
 QUALITY_GATE_MEAN_IOU="${QUALITY_GATE_MEAN_IOU:-0.0}"
 QUALITY_GATE_IOU50="${QUALITY_GATE_IOU50:-0.0}"
 HEAD_HIDDEN_DIM="${HEAD_HIDDEN_DIM:-256}"
@@ -98,6 +109,9 @@ echo "Search area factor: $SEARCH_AREA_FACTOR"
 echo "Search scale jitter: $SEARCH_SCALE_JITTER"
 echo "Search translation jitter: $SEARCH_TRANSLATION_JITTER"
 echo "Search min object size: $SEARCH_MIN_OBJECT_SIZE"
+echo "Search anchor mode: $SEARCH_ANCHOR_MODE"
+echo "Repair search to target: $REPAIR_SEARCH_TO_TARGET"
+echo "Search target padding fraction: $SEARCH_TARGET_PADDING_FRACTION"
 echo "Template sampling: $TEMPLATE_SAMPLING"
 echo "Previous box jitter: $PREVIOUS_BOX_JITTER"
 echo "Sequence window length: $SEQUENCE_WINDOW_LENGTH"
@@ -106,8 +120,12 @@ echo "Max lost targets per frame: $MAX_LOST_TARGETS_PER_FRAME"
 echo "Max missing gap frames: $MAX_MISSING_GAP_FRAMES"
 echo "Epochs: $EPOCHS"
 echo "Max steps: $MAX_STEPS"
-echo "Loss weights: box=$BOX_LOSS_WEIGHT ltrb=$LTRB_LOSS_WEIGHT reid=$REID_LOSS_WEIGHT center_positive=$CENTER_POSITIVE_WEIGHT negative=$NEGATIVE_LOSS_WEIGHT hard_negative=$HARD_NEGATIVE_LOSS_WEIGHT focal_gamma=$FOCAL_LOSS_GAMMA"
+echo "Loss weights: box=$BOX_LOSS_WEIGHT ltrb=$LTRB_LOSS_WEIGHT reid=$REID_LOSS_WEIGHT center_positive=$CENTER_POSITIVE_WEIGHT negative=$NEGATIVE_LOSS_WEIGHT hard_negative=$HARD_NEGATIVE_LOSS_WEIGHT focal_gamma=$FOCAL_LOSS_GAMMA dcfst=$DCFST_DISCRIMINATION_WEIGHT dcfst_neg=$DCFST_NEGATIVE_CANDIDATES dcfst_margin=$DCFST_MARGIN"
 echo "Overfit smoke: $OVERFIT_SMOKE samples=$OVERFIT_SMOKE_SAMPLES quality_gate_mean_iou=$QUALITY_GATE_MEAN_IOU quality_gate_iou50=$QUALITY_GATE_IOU50"
+echo "Overfit single object: $OVERFIT_SINGLE_OBJECT"
+echo "Debug sequence: ${DEBUG_SEQUENCE_NAME:-all}"
+echo "Debug track id: ${DEBUG_TRACK_ID:-all}"
+echo "Debug visuals: samples=$DEBUG_VISUAL_SAMPLES every_epoch=$DEBUG_VISUAL_EVERY_EPOCH"
 
 if [[ ! -f "$BUNDLE" ]]; then
     echo "Missing bundle: $BUNDLE"
@@ -151,7 +169,8 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
 fi
 
 source "$VENV_DIR/bin/activate"
-python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade pip wheel
+python -m pip install "setuptools<82"
 python -m pip install torch torchvision --index-url "$PYTORCH_INDEX_URL"
 python -m pip install -r external/LoRAT-main/requirements.txt
 python -m pip install -r requirements.txt
@@ -198,6 +217,21 @@ for CONFIG in "${TRAIN_CONFIG_ARRAY[@]}"; do
     if [[ "$OVERFIT_SMOKE" == "1" ]]; then
         EXTRA_ARGS+=(--overfit-smoke)
     fi
+    if [[ "$OVERFIT_SINGLE_OBJECT" == "1" ]]; then
+        EXTRA_ARGS+=(--overfit-single-object)
+    fi
+    if [[ "$REPAIR_SEARCH_TO_TARGET" != "1" ]]; then
+        EXTRA_ARGS+=(--disable-search-target-repair)
+    fi
+    if [[ -n "$DEBUG_SEQUENCE_NAME" ]]; then
+        EXTRA_ARGS+=(--debug-sequence-name "$DEBUG_SEQUENCE_NAME")
+    fi
+    if [[ -n "$DEBUG_TRACK_ID" ]]; then
+        EXTRA_ARGS+=(--debug-track-id "$DEBUG_TRACK_ID")
+    fi
+    if [[ "$DEBUG_VISUAL_EVERY_EPOCH" == "1" ]]; then
+        EXTRA_ARGS+=(--debug-visual-every-epoch)
+    fi
 
     python programs/train_lorat_v8_head.py \
         --dataset-root "$DATASET_ROOT" \
@@ -214,6 +248,8 @@ for CONFIG in "${TRAIN_CONFIG_ARRAY[@]}"; do
         --search-scale-jitter "$SEARCH_SCALE_JITTER" \
         --search-translation-jitter "$SEARCH_TRANSLATION_JITTER" \
         --search-min-object-size "$SEARCH_MIN_OBJECT_SIZE" \
+        --search-anchor-mode "$SEARCH_ANCHOR_MODE" \
+        --search-target-padding-fraction "$SEARCH_TARGET_PADDING_FRACTION" \
         --template-sampling "$TEMPLATE_SAMPLING" \
         --previous-box-jitter "$PREVIOUS_BOX_JITTER" \
         --sequence-window-length "$SEQUENCE_WINDOW_LENGTH" \
@@ -237,6 +273,9 @@ for CONFIG in "${TRAIN_CONFIG_ARRAY[@]}"; do
         --negative-loss-weight "$NEGATIVE_LOSS_WEIGHT" \
         --hard-negative-loss-weight "$HARD_NEGATIVE_LOSS_WEIGHT" \
         --focal-loss-gamma "$FOCAL_LOSS_GAMMA" \
+        --dcfst-discrimination-weight "$DCFST_DISCRIMINATION_WEIGHT" \
+        --dcfst-negative-candidates "$DCFST_NEGATIVE_CANDIDATES" \
+        --dcfst-margin "$DCFST_MARGIN" \
         --iou-aware-warmup-steps "$IOU_AWARE_WARMUP_STEPS" \
         --gaussian-sigma "$GAUSSIAN_SIGMA" \
         --clip-max-norm "$CLIP_MAX_NORM" \
@@ -251,6 +290,10 @@ for CONFIG in "${TRAIN_CONFIG_ARRAY[@]}"; do
         --quality-gate-mean-iou "$QUALITY_GATE_MEAN_IOU" \
         --quality-gate-iou50 "$QUALITY_GATE_IOU50" \
         --diagnostic-csv "$RESULT_ROOT/logs/train_${CONFIG_SAFE}_diagnostics.csv" \
+        --geometry-diagnostic-csv "$RESULT_ROOT/logs/train_${CONFIG_SAFE}_geometry.csv" \
+        --iou-diagnostic-csv "$RESULT_ROOT/logs/train_${CONFIG_SAFE}_iou_failures.csv" \
+        --debug-visual-dir "$RESULT_ROOT/debug_visuals/$CONFIG_SAFE" \
+        --debug-visual-samples "$DEBUG_VISUAL_SAMPLES" \
         --output "$OUTPUT" \
         "${EXTRA_ARGS[@]}" 2>&1 | tee "$LOG_PATH"
 

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import copy
@@ -15,9 +15,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-import bounding_box_v5_lorat_shared as v5
+import mot_common as mot
 
-BBox = v5.BBox
+BBox = mot.BBox
 
 V8_EXECUTION_MODE = "shared-frame-vit-batched-heads-feature-reid"
 DEFAULT_V8_PRIMARY_HEADS_PER_TRACK = 1
@@ -41,6 +41,10 @@ DEFAULT_V8_MEMORY_MIN_MOTION = 0.45
 DEFAULT_V8_MEMORY_MIN_PATH = 0.45
 DEFAULT_V8_MEMORY_MIN_APPEARANCE = 0.42
 DEFAULT_V8_MEMORY_MIN_STABLE_UPDATES = 2
+DEFAULT_V8_ACCEPT_MIN_INITIAL_ANCHOR = 0.50
+DEFAULT_V8_ACCEPT_MIN_IDENTITY_MARGIN = -0.05
+DEFAULT_V8_MEMORY_MIN_INITIAL_ANCHOR = 0.58
+DEFAULT_V8_MEMORY_MIN_IDENTITY_MARGIN = 0.02
 DEFAULT_V8_WINDOW_PENALTY_RATIO = 0.45
 V8_PROFILE_BUCKETS = (
     "candidate_transfer",
@@ -113,9 +117,9 @@ WEEK2_PROOF_LOG_HEADER = (
     "gpu_peak_reserved_mb,week2_shared_backbone_ok,week2_batched_head_ok\n"
 )
 
-V8_DEBUG_LOG_HEADER = v5.DEBUG_LOG_HEADER.replace(
+V8_DEBUG_LOG_HEADER = mot.DEBUG_LOG_HEADER.replace(
     "appearance_bank_size\n",
-    "legacy_appearance_bank_size,v8_feature_bank_size\n",
+    "legacy_appearance_bank_size,v8_feature_bank_size,track_lifecycle_state\n",
 )
 
 
@@ -300,7 +304,10 @@ class BatchedObjectConditionedHead:
         path = path.resolve()
         if not path.exists():
             raise RuntimeError(f"V8 head weight file not found: {path}")
-        state = self.torch.load(str(path), map_location=self.device)
+        try:
+            state = self.torch.load(str(path), map_location=self.device, weights_only=False)
+        except TypeError:
+            state = self.torch.load(str(path), map_location=self.device)
         if isinstance(state, dict) and "model" in state:
             state = state["model"]
         self.module.load_state_dict(state, strict=True)
@@ -453,7 +460,7 @@ class BatchedObjectConditionedHead:
         )
 
 
-class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
+class V8FeatureIdentityArbitrator(mot.LightweightIdentityArbitrator):
     """V8 identity arbitration over shared-backbone feature tensors.
 
     V5's arbitrator extracts color/gradient histograms from image crops when
@@ -484,8 +491,8 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
 
     def _remember_score_matrices(
         self,
-        tracks: Sequence[v5.TrackState],
-        outputs: Sequence[v5.LoRATSlotOutput],
+        tracks: Sequence[mot.TrackState],
+        outputs: Sequence[mot.LoRATSlotOutput],
         matrices: Dict[str, np.ndarray],
     ) -> None:
         self._last_score_track_ids = tuple(id(track) for track in tracks)
@@ -494,11 +501,11 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
 
     def score_from_cached_matrices(
         self,
-        tracks: Sequence[v5.TrackState],
-        outputs: Sequence[v5.LoRATSlotOutput],
-        track: v5.TrackState,
-        output: v5.LoRATSlotOutput,
-    ) -> v5.IdentityScore:
+        tracks: Sequence[mot.TrackState],
+        outputs: Sequence[mot.LoRATSlotOutput],
+        track: mot.TrackState,
+        output: mot.LoRATSlotOutput,
+    ) -> mot.IdentityScore:
         """Return a pair score from the frame-level batched matrix when available."""
 
         track_ids = tuple(id(candidate_track) for candidate_track in tracks)
@@ -517,7 +524,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             return self.score(track, output, tracks)
         return self._identity_score_from_matrices(matrices, row, col)
 
-    def initialize_track(self, track: v5.TrackState, frame: np.ndarray) -> None:
+    def initialize_track(self, track: mot.TrackState, frame: np.ndarray) -> None:
         return None
 
     def normalize_feature(self, vector):
@@ -525,10 +532,10 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             return None
         return self.F.normalize(vector.detach().to(self.device, dtype=self.torch.float32).flatten(), dim=0)
 
-    def output_feature(self, output: v5.LoRATSlotOutput):
+    def output_feature(self, output: mot.LoRATSlotOutput):
         return self.normalize_feature(getattr(output, "v8_feature", None))
 
-    def track_has_feature_appearance(self, track: v5.TrackState) -> bool:
+    def track_has_feature_appearance(self, track: mot.TrackState) -> bool:
         return (
             getattr(track, "v8_initial_feature", None) is not None
             or getattr(track, "v8_appearance_feature", None) is not None
@@ -571,7 +578,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
         )
         return np.where(union > 0.0, intersection / np.maximum(union, 1e-6), 0.0).astype(np.float32)
 
-    def _output_feature_stack(self, outputs: Sequence[v5.LoRATSlotOutput]):
+    def _output_feature_stack(self, outputs: Sequence[mot.LoRATSlotOutput]):
         normalized = []
         valid: List[bool] = []
         feature_dim: Optional[int] = None
@@ -591,7 +598,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
         stacked = self.torch.stack([vector if vector is not None else zero for vector in normalized], dim=0)
         return stacked, np.asarray(valid, dtype=bool)
 
-    def _track_memory_similarity_rows(self, tracks: Sequence[v5.TrackState], candidate_features, candidate_valid: np.ndarray):
+    def _track_memory_similarity_rows(self, tracks: Sequence[mot.TrackState], candidate_features, candidate_valid: np.ndarray):
         track_count = len(tracks)
         output_count = int(candidate_features.shape[0]) if candidate_features is not None else int(candidate_valid.shape[0])
         appearance_rows = []
@@ -642,7 +649,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
                     initial_anchor = self.torch.clamp(((initial @ candidate_features.transpose(0, 1)) + 1.0) * 0.5, 0.0, 1.0)
                     top_count = min(4, int(sorted_scores.shape[0]))
                     top_average = sorted_scores[:top_count].mean(dim=0)
-                    appearance = (0.54 * best_pair) + (0.30 * initial_anchor) + (0.16 * top_average)
+                    appearance = (0.44 * best_pair) + (0.42 * initial_anchor) + (0.14 * top_average)
             appearance_rows.append(appearance)
             initial_rows.append(initial_anchor)
 
@@ -680,7 +687,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
                     other_track_ids[row_index, col_index] = int(tracks[int(best_indices[col_index])].track_id)
         return appearance, initial_anchor, other_anchor, other_track_ids
 
-    def track_feature_similarity_many(self, track: v5.TrackState, candidate_features) -> np.ndarray:
+    def track_feature_similarity_many(self, track: mot.TrackState, candidate_features) -> np.ndarray:
         if candidate_features is None:
             return np.zeros((0,), dtype=np.float32)
         if candidate_features.ndim == 1:
@@ -711,7 +718,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             appearance = best_pair
         else:
             top_count = min(4, int(sorted_scores.shape[0]))
-            appearance = (0.54 * best_pair) + (0.30 * initial_score) + (0.16 * sorted_scores[:top_count].mean(dim=0))
+            appearance = (0.44 * best_pair) + (0.42 * initial_score) + (0.14 * sorted_scores[:top_count].mean(dim=0))
         return appearance.detach().to(device="cpu", dtype=self.torch.float32).numpy().astype(np.float32)
 
     def _motion_matrix(self, predicted: np.ndarray, candidates: np.ndarray, reference_diagonal: np.ndarray) -> np.ndarray:
@@ -727,7 +734,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
         aspect_score = np.maximum(0.0, 1.0 - np.minimum(1.0, aspect_change))
         return ((0.68 * center_score) + (0.22 * scale_score) + (0.10 * aspect_score)).astype(np.float32)
 
-    def _path_matrix(self, tracks: Sequence[v5.TrackState], candidates: np.ndarray) -> np.ndarray:
+    def _path_matrix(self, tracks: Sequence[mot.TrackState], candidates: np.ndarray) -> np.ndarray:
         output_count = candidates.shape[0]
         candidate_centers = self._bbox_center_array(candidates)
         path = np.full((len(tracks), output_count), 0.5, dtype=np.float32)
@@ -738,33 +745,33 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             first_frame, first_bbox = samples[0]
             last_frame, last_bbox = samples[-1]
             dt = max(1, int(last_frame) - int(first_frame))
-            first_center = np.asarray(v5.bbox_center(first_bbox), dtype=np.float32)
-            last_center = np.asarray(v5.bbox_center(last_bbox), dtype=np.float32)
+            first_center = np.asarray(mot.bbox_center(first_bbox), dtype=np.float32)
+            last_center = np.asarray(mot.bbox_center(last_bbox), dtype=np.float32)
             velocity = (last_center - first_center) / float(dt)
             speed = float(np.linalg.norm(velocity))
-            reference_diagonal = max(1.0, v5.bbox_diagonal(last_bbox))
-            recent_centers = [np.asarray(v5.bbox_center(bbox), dtype=np.float32) for _, bbox in samples]
+            reference_diagonal = max(1.0, mot.bbox_diagonal(last_bbox))
+            recent_centers = [np.asarray(mot.bbox_center(bbox), dtype=np.float32) for _, bbox in samples]
             recent_steps = [
                 float(np.linalg.norm(right - left))
                 for left, right in zip(recent_centers, recent_centers[1:])
             ]
             median_step = float(np.median(np.asarray(recent_steps, dtype=np.float32))) if recent_steps else 0.0
-            is_directional = speed >= v5.DEFAULT_CENTER_PATH_DIRECTION_MIN_SPEED and median_step >= 1.0
+            is_directional = speed >= mot.DEFAULT_CENTER_PATH_DIRECTION_MIN_SPEED and median_step >= 1.0
             candidate_vectors = candidate_centers - last_center[None, :]
             candidate_distances = np.linalg.norm(candidate_vectors, axis=1)
             if not is_directional:
                 local_radius = max(
                     8.0,
                     min(
-                        v5.DEFAULT_CENTER_PATH_STATIONARY_RADIUS,
-                        (median_step * v5.DEFAULT_CENTER_PATH_STATIONARY_STEP_FACTOR)
-                        + (reference_diagonal * v5.DEFAULT_CENTER_PATH_STATIONARY_BOX_FACTOR),
+                        mot.DEFAULT_CENTER_PATH_STATIONARY_RADIUS,
+                        (median_step * mot.DEFAULT_CENTER_PATH_STATIONARY_STEP_FACTOR)
+                        + (reference_diagonal * mot.DEFAULT_CENTER_PATH_STATIONARY_BOX_FACTOR),
                     ),
                 )
                 row = np.maximum(0.0, 1.0 - np.minimum(1.0, candidate_distances / local_radius))
                 previous_vector = recent_centers[-1] - recent_centers[-2]
                 previous_distance = float(np.linalg.norm(previous_vector))
-                reversal_distance = max(6.0, median_step * v5.DEFAULT_CENTER_PATH_REVERSAL_STEP_FACTOR)
+                reversal_distance = max(6.0, median_step * mot.DEFAULT_CENTER_PATH_REVERSAL_STEP_FACTOR)
                 reversal_mask = (previous_distance >= 2.0) & (candidate_distances >= reversal_distance)
                 if bool(np.any(reversal_mask)):
                     cosine = np.sum(previous_vector[None, :] * candidate_vectors, axis=1) / np.maximum(
@@ -772,8 +779,8 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
                         1e-6,
                     )
                     row = np.where(
-                        reversal_mask & (cosine <= v5.DEFAULT_CENTER_PATH_REVERSAL_MIN_COSINE),
-                        row * v5.DEFAULT_CENTER_PATH_REVERSAL_PENALTY,
+                        reversal_mask & (cosine <= mot.DEFAULT_CENTER_PATH_REVERSAL_MIN_COSINE),
+                        row * mot.DEFAULT_CENTER_PATH_REVERSAL_PENALTY,
                         row,
                     )
                 path[row_index, :] = np.clip(row, 0.0, 1.0).astype(np.float32)
@@ -801,7 +808,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             path[row_index, :] = np.clip(row, 0.0, 1.0).astype(np.float32)
         return path
 
-    def _occlusion_matrices(self, tracks: Sequence[v5.TrackState], candidates: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _occlusion_matrices(self, tracks: Sequence[mot.TrackState], candidates: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         track_count = len(tracks)
         output_count = candidates.shape[0]
         occlusion_iou = np.zeros((track_count, output_count), dtype=np.float32)
@@ -827,8 +834,8 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
 
     def _identity_score_matrices(
         self,
-        tracks: Sequence[v5.TrackState],
-        outputs: Sequence[v5.LoRATSlotOutput],
+        tracks: Sequence[mot.TrackState],
+        outputs: Sequence[mot.LoRATSlotOutput],
     ) -> Dict[str, np.ndarray]:
         track_count = len(tracks)
         output_count = len(outputs)
@@ -839,7 +846,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             candidate_valid,
         )
         track_boxes = self._xywh_array([track.bbox for track in tracks])
-        predicted_boxes = self._xywh_array([v5.kalman_prediction_reference(track) for track in tracks])
+        predicted_boxes = self._xywh_array([mot.kalman_prediction_reference(track) for track in tracks])
         candidate_boxes = self._xywh_array([output.bbox for output in outputs])
         reference_diagonal = np.maximum(1.0, np.hypot(track_boxes[:, 2], track_boxes[:, 3]))
         motion = self._motion_matrix(predicted_boxes, candidate_boxes, reference_diagonal)
@@ -860,17 +867,23 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
 
         anchor_conflict = (
             (other_track_ids >= 0)
-            & (occlusion_iou >= v5.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_IOU)
-            & (other_anchor >= v5.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_OTHER)
-            & (identity_margin <= -v5.DEFAULT_IDENTITY_ANCHOR_STEAL_MARGIN)
+            & (occlusion_iou >= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_IOU)
+            & (other_anchor >= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_OTHER)
+            & (identity_margin <= -mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MARGIN)
         )
-        source = np.where(anchor_conflict, source * v5.DEFAULT_IDENTITY_ANCHOR_STEAL_PENALTY, source)
-        motion = np.where(anchor_conflict, motion * v5.DEFAULT_IDENTITY_ANCHOR_STEAL_PENALTY, motion)
+        source = np.where(anchor_conflict, source * mot.DEFAULT_IDENTITY_ANCHOR_STEAL_PENALTY, source)
+        motion = np.where(anchor_conflict, motion * mot.DEFAULT_IDENTITY_ANCHOR_STEAL_PENALTY, motion)
 
         cross_source = track_ids[:, None] != source_ids[None, :]
         source = np.where(cross_source & (appearance < max(0.30, self.min_reid)), source * 0.35, source)
         has_feature = np.asarray([self.track_has_feature_appearance(track) for track in tracks], dtype=bool)[:, None]
         motion = np.where(has_feature & (appearance < self.min_reid), motion * 0.45, motion)
+        weak_initial_anchor = has_feature & (initial_anchor < max(0.45, self.min_reid - 0.02)) & (appearance < max(0.52, self.min_reid))
+        source = np.where(weak_initial_anchor, source * 0.60, source)
+        motion = np.where(weak_initial_anchor, motion * 0.70, motion)
+        ambiguous_initial_anchor = has_feature & (other_track_ids >= 0) & (other_anchor >= 0.60) & (identity_margin < -0.03)
+        source = np.where(ambiguous_initial_anchor, source * 0.45, source)
+        motion = np.where(ambiguous_initial_anchor, motion * 0.70, motion)
         source = np.where((motion < self.min_motion) & (confidence < 0.70), source * 0.65, source)
         source = np.where((path < self.min_path) & (confidence < 0.75), source * 0.55, source)
 
@@ -901,10 +914,10 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
         }
 
     @staticmethod
-    def _identity_score_from_matrices(matrices: Dict[str, np.ndarray], row: int, col: int) -> v5.IdentityScore:
+    def _identity_score_from_matrices(matrices: Dict[str, np.ndarray], row: int, col: int) -> mot.IdentityScore:
         other_track_id_value = int(matrices["other_track_ids"][row, col])
         occlusion_track_id_value = int(matrices["occlusion_track_ids"][row, col])
-        return v5.IdentityScore(
+        return mot.IdentityScore(
             total=float(matrices["total"][row, col]),
             appearance=float(matrices["appearance"][row, col]),
             motion=float(matrices["motion"][row, col]),
@@ -934,7 +947,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
     def _solve_assignment_matrix(score_matrix: np.ndarray, min_score: float) -> List[Tuple[int, int, float]]:
         if score_matrix.size == 0 or score_matrix.shape[0] == 0 or score_matrix.shape[1] == 0:
             return []
-        row_indices, col_indices = v5.linear_sum_assignment(-score_matrix)
+        row_indices, col_indices = mot.linear_sum_assignment(-score_matrix)
         assignments: List[Tuple[int, int, float]] = []
         for row_index, col_index in zip(row_indices.tolist(), col_indices.tolist()):
             score = float(score_matrix[row_index, col_index])
@@ -951,7 +964,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
         cosine = float(self.torch.dot(left, right).detach().to(device="cpu", dtype=self.torch.float32).item())
         return max(0.0, min(1.0, (cosine + 1.0) * 0.5))
 
-    def track_feature_similarity(self, track: v5.TrackState, candidate) -> float:
+    def track_feature_similarity(self, track: mot.TrackState, candidate) -> float:
         candidate = self.normalize_feature(candidate)
         if candidate is None:
             return 0.50
@@ -974,14 +987,14 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             return best_pair
         top_count = min(4, len(scores))
         top_average = float(sum(scores[:top_count]) / top_count)
-        return (0.54 * best_pair) + (0.30 * initial_score) + (0.16 * top_average)
+        return (0.44 * best_pair) + (0.42 * initial_score) + (0.14 * top_average)
 
     def resolve(
         self,
-        tracks: Sequence[v5.TrackState],
-        outputs: Sequence[v5.LoRATSlotOutput],
+        tracks: Sequence[mot.TrackState],
+        outputs: Sequence[mot.LoRATSlotOutput],
         frame: Optional[np.ndarray],
-    ) -> List[v5.IdentityAssignment]:
+    ) -> List[mot.IdentityAssignment]:
         if not self.enabled:
             self._clear_score_cache()
             return self._owned_only_assignments(tracks, outputs)
@@ -1004,7 +1017,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             if self.track_has_feature_appearance(track) and score_parts.appearance < self.min_reid and not is_view_change:
                 continue
             assignments.append(
-                v5.IdentityAssignment(
+                mot.IdentityAssignment(
                     track=track,
                     output=output,
                     score=score_parts,
@@ -1015,10 +1028,10 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
 
     def score(
         self,
-        track: v5.TrackState,
-        output: v5.LoRATSlotOutput,
-        all_tracks: Sequence[v5.TrackState] = (),
-    ) -> v5.IdentityScore:
+        track: mot.TrackState,
+        output: mot.LoRATSlotOutput,
+        all_tracks: Sequence[mot.TrackState] = (),
+    ) -> mot.IdentityScore:
         confidence = 0.5 if output.confidence is None else max(0.0, min(1.0, float(output.confidence)))
         candidate = self.output_feature(output)
         appearance = 0.5
@@ -1040,29 +1053,35 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
                     other_anchor = other_score
                     other_track_id = other.track_id
 
-        predicted = v5.kalman_prediction_reference(track)
-        reference_diagonal = max(1.0, v5.bbox_diagonal(track.bbox))
-        motion = v5.motion_affinity(predicted, output.bbox, reference_diagonal)
-        path = v5.center_path_affinity(track, output.bbox)
-        iou = max(v5.bbox_iou(track.bbox, output.bbox), v5.bbox_iou(predicted, output.bbox))
-        occlusion_track_id, occlusion_iou = v5.strongest_track_overlap(track, output.bbox, all_tracks)
+        predicted = mot.kalman_prediction_reference(track)
+        reference_diagonal = max(1.0, mot.bbox_diagonal(track.bbox))
+        motion = mot.motion_affinity(predicted, output.bbox, reference_diagonal)
+        path = mot.center_path_affinity(track, output.bbox)
+        iou = max(mot.bbox_iou(track.bbox, output.bbox), mot.bbox_iou(predicted, output.bbox))
+        occlusion_track_id, occlusion_iou = mot.strongest_track_overlap(track, output.bbox, all_tracks)
         source = 1.0 if output.source_track_id == track.track_id else 0.24
 
         identity_margin = initial_anchor - other_anchor
         anchor_conflict = (
             other_track_id is not None
-            and occlusion_iou >= v5.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_IOU
-            and other_anchor >= v5.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_OTHER
-            and identity_margin <= -v5.DEFAULT_IDENTITY_ANCHOR_STEAL_MARGIN
+            and occlusion_iou >= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_IOU
+            and other_anchor >= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_OTHER
+            and identity_margin <= -mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MARGIN
         )
         if anchor_conflict:
-            source *= v5.DEFAULT_IDENTITY_ANCHOR_STEAL_PENALTY
-            motion *= v5.DEFAULT_IDENTITY_ANCHOR_STEAL_PENALTY
+            source *= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_PENALTY
+            motion *= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_PENALTY
 
         if output.source_track_id != track.track_id and appearance < max(0.30, self.min_reid):
             source *= 0.35
         if self.track_has_feature_appearance(track) and appearance < self.min_reid:
             motion *= 0.45
+        if self.track_has_feature_appearance(track) and initial_anchor < max(0.45, self.min_reid - 0.02) and appearance < max(0.52, self.min_reid):
+            source *= 0.60
+            motion *= 0.70
+        if other_track_id is not None and other_anchor >= 0.60 and identity_margin < -0.03:
+            source *= 0.45
+            motion *= 0.70
         if motion < self.min_motion and confidence < 0.70:
             source *= 0.65
         if path < self.min_path and confidence < 0.75:
@@ -1076,7 +1095,7 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             + (0.10 * confidence)
             + (0.04 * iou)
         )
-        return v5.IdentityScore(
+        return mot.IdentityScore(
             total=max(0.0, min(1.0, float(total))),
             appearance=appearance,
             motion=motion,
@@ -1094,9 +1113,9 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
 
     def commit_track_memory(
         self,
-        track: v5.TrackState,
-        output: v5.LoRATSlotOutput,
-        assignment: v5.IdentityAssignment,
+        track: mot.TrackState,
+        output: mot.LoRATSlotOutput,
+        assignment: mot.IdentityAssignment,
         frame: Optional[np.ndarray],
     ) -> None:
         feature = self.output_feature(output)
@@ -1107,6 +1126,15 @@ class V8FeatureIdentityArbitrator(v5.LightweightIdentityArbitrator):
             return
         if self.track_has_feature_appearance(track) and assignment.score.appearance < max(self.min_reid, 0.30) and not is_view_change:
             return
+        if getattr(track, "v8_initial_feature", None) is not None and not is_view_change:
+            if assignment.score.initial_anchor < max(self.min_reid, 0.50):
+                return
+            if (
+                assignment.score.other_track_id is not None
+                and assignment.score.other_anchor >= 0.55
+                and assignment.score.identity_margin < 0.0
+            ):
+                return
         if assignment.score.motion < self.min_motion and not is_view_change:
             return
         if assignment.score.total < max(self.min_score, 0.50) and not is_view_change:
@@ -1140,9 +1168,9 @@ class V8QualityBatchedLoRATTracker:
     keeps LoRAT's LoRA-adapted DINOv2 blocks as the shared frame backbone and moves the
     object-specific work into a small batched low-rank head bank.
 
-    V8 intentionally does not subclass the v5/v6 trackers and does not call the
-    upstream per-object LoRAT evaluator in its frame update path. It imports v5 only
-    for shared dataclasses, geometry helpers, debug writers, and UI/output helpers.
+    V8 intentionally does not subclass the previous tracker versions and does not call the
+    upstream per-object LoRAT evaluator in its frame update path. Shared dataclasses,
+    geometry helpers, debug writers, and UI/output helpers now live in mot_common.
     Compared with v7, it adds guarded shared-feature template recovery so the
     untrained shared head can recover some of the v6 quality behavior without losing
     the Week 2 property: one shared backbone pass plus one batched per-object head pass.
@@ -1162,7 +1190,7 @@ class V8QualityBatchedLoRATTracker:
         sequence_name: str,
         disable_amp: bool,
         frame_size: int = 0,
-        head_rank: int = v5.DEFAULT_LORAT_MEMORY_SLOTS,
+        head_rank: int = mot.DEFAULT_LORAT_MEMORY_SLOTS,
         head_hidden_dim: int = 256,
         head_lora_rank: int = 16,
         head_weight_path: Optional[Path] = None,
@@ -1170,39 +1198,39 @@ class V8QualityBatchedLoRATTracker:
         min_confidence: float = 0.48,
         template_update_rate: float = 0.08,
         template_update_min_confidence: float = 0.58,
-        lorat_memory_slots: int = v5.DEFAULT_LORAT_MEMORY_SLOTS,
-        lorat_memory_refresh_interval: int = v5.DEFAULT_LORAT_MEMORY_REFRESH_INTERVAL,
+        lorat_memory_slots: int = mot.DEFAULT_LORAT_MEMORY_SLOTS,
+        lorat_memory_refresh_interval: int = mot.DEFAULT_LORAT_MEMORY_REFRESH_INTERVAL,
         lorat_memory_min_score: float = 0.55,
-        lorat_accept_min_score: float = v5.DEFAULT_LORAT_ACCEPT_MIN_SCORE,
-        lorat_fixed_box_size: bool = v5.DEFAULT_LORAT_FIXED_BOX_SIZE,
-        lorat_min_box_area: float = v5.DEFAULT_LORAT_MIN_BOX_AREA,
-        lorat_max_area_change_per_frame: float = v5.DEFAULT_LORAT_MAX_AREA_CHANGE_PER_FRAME,
-        lorat_trusted_size_floor_scale: float = v5.DEFAULT_LORAT_TRUSTED_SIZE_FLOOR_SCALE,
-        shrink_guard_window: int = v5.DEFAULT_SHRINK_GUARD_WINDOW,
-        shrink_guard_area_ratio: float = v5.DEFAULT_SHRINK_GUARD_AREA_RATIO,
-        shrink_guard_step_ratio: float = v5.DEFAULT_SHRINK_GUARD_STEP_RATIO,
-        shrink_guard_min_confidence: float = v5.DEFAULT_SHRINK_GUARD_MIN_CONFIDENCE,
-        shrink_guard_min_reid: float = v5.DEFAULT_SHRINK_GUARD_MIN_REID,
-        crop_information_min_score: float = v5.DEFAULT_CROP_INFORMATION_MIN_SCORE,
-        crop_information_min_pixels: int = v5.DEFAULT_CROP_INFORMATION_MIN_PIXELS,
+        lorat_accept_min_score: float = mot.DEFAULT_LORAT_ACCEPT_MIN_SCORE,
+        lorat_fixed_box_size: bool = mot.DEFAULT_LORAT_FIXED_BOX_SIZE,
+        lorat_min_box_area: float = mot.DEFAULT_LORAT_MIN_BOX_AREA,
+        lorat_max_area_change_per_frame: float = mot.DEFAULT_LORAT_MAX_AREA_CHANGE_PER_FRAME,
+        lorat_trusted_size_floor_scale: float = mot.DEFAULT_LORAT_TRUSTED_SIZE_FLOOR_SCALE,
+        shrink_guard_window: int = mot.DEFAULT_SHRINK_GUARD_WINDOW,
+        shrink_guard_area_ratio: float = mot.DEFAULT_SHRINK_GUARD_AREA_RATIO,
+        shrink_guard_step_ratio: float = mot.DEFAULT_SHRINK_GUARD_STEP_RATIO,
+        shrink_guard_min_confidence: float = mot.DEFAULT_SHRINK_GUARD_MIN_CONFIDENCE,
+        shrink_guard_min_reid: float = mot.DEFAULT_SHRINK_GUARD_MIN_REID,
+        crop_information_min_score: float = mot.DEFAULT_CROP_INFORMATION_MIN_SCORE,
+        crop_information_min_pixels: int = mot.DEFAULT_CROP_INFORMATION_MIN_PIXELS,
         identity_arbitration: bool = True,
-        identity_min_score: float = v5.DEFAULT_IDENTITY_MIN_SCORE,
-        identity_min_reid: float = v5.DEFAULT_IDENTITY_MIN_REID,
-        identity_min_motion: float = v5.DEFAULT_IDENTITY_MIN_MOTION,
-        identity_min_path: float = v5.DEFAULT_IDENTITY_MIN_PATH,
+        identity_min_score: float = mot.DEFAULT_IDENTITY_MIN_SCORE,
+        identity_min_reid: float = mot.DEFAULT_IDENTITY_MIN_REID,
+        identity_min_motion: float = mot.DEFAULT_IDENTITY_MIN_MOTION,
+        identity_min_path: float = mot.DEFAULT_IDENTITY_MIN_PATH,
         identity_bank_size: int = 12,
-        identity_memory_min_confidence: float = v5.DEFAULT_IDENTITY_MEMORY_MIN_CONFIDENCE,
-        occlusion_max_frames: int = v5.DEFAULT_OCCLUSION_MAX_FRAMES,
-        occlusion_iou_threshold: float = v5.DEFAULT_OCCLUSION_IOU_THRESHOLD,
-        occlusion_velocity_damping: float = v5.DEFAULT_OCCLUSION_VELOCITY_DAMPING,
-        reid_recovery_min_score: float = v5.DEFAULT_REID_RECOVERY_MIN_SCORE,
-        reid_recovery_min_reid: float = v5.DEFAULT_REID_RECOVERY_MIN_REID,
-        reid_recovery_min_motion: float = v5.DEFAULT_REID_RECOVERY_MIN_MOTION,
-        reid_recovery_min_confidence: float = v5.DEFAULT_REID_RECOVERY_MIN_CONFIDENCE,
-        view_change_min_score: float = v5.DEFAULT_VIEW_CHANGE_MIN_SCORE,
-        view_change_min_motion: float = v5.DEFAULT_VIEW_CHANGE_MIN_MOTION,
-        view_change_min_confidence: float = v5.DEFAULT_VIEW_CHANGE_MIN_CONFIDENCE,
-        view_change_max_lost_frames: int = v5.DEFAULT_VIEW_CHANGE_MAX_LOST_FRAMES,
+        identity_memory_min_confidence: float = mot.DEFAULT_IDENTITY_MEMORY_MIN_CONFIDENCE,
+        occlusion_max_frames: int = mot.DEFAULT_OCCLUSION_MAX_FRAMES,
+        occlusion_iou_threshold: float = mot.DEFAULT_OCCLUSION_IOU_THRESHOLD,
+        occlusion_velocity_damping: float = mot.DEFAULT_OCCLUSION_VELOCITY_DAMPING,
+        reid_recovery_min_score: float = mot.DEFAULT_REID_RECOVERY_MIN_SCORE,
+        reid_recovery_min_reid: float = mot.DEFAULT_REID_RECOVERY_MIN_REID,
+        reid_recovery_min_motion: float = mot.DEFAULT_REID_RECOVERY_MIN_MOTION,
+        reid_recovery_min_confidence: float = mot.DEFAULT_REID_RECOVERY_MIN_CONFIDENCE,
+        view_change_min_score: float = mot.DEFAULT_VIEW_CHANGE_MIN_SCORE,
+        view_change_min_motion: float = mot.DEFAULT_VIEW_CHANGE_MIN_MOTION,
+        view_change_min_confidence: float = mot.DEFAULT_VIEW_CHANGE_MIN_CONFIDENCE,
+        view_change_max_lost_frames: int = mot.DEFAULT_VIEW_CHANGE_MAX_LOST_FRAMES,
         v8_primary_heads_per_track: int = DEFAULT_V8_PRIMARY_HEADS_PER_TRACK,
         v8_recovery_heads_per_track: int = DEFAULT_V8_RECOVERY_HEADS_PER_TRACK,
         v8_recovery_interval: int = DEFAULT_V8_RECOVERY_INTERVAL,
@@ -1224,6 +1252,10 @@ class V8QualityBatchedLoRATTracker:
         v8_memory_min_path: float = DEFAULT_V8_MEMORY_MIN_PATH,
         v8_memory_min_appearance: float = DEFAULT_V8_MEMORY_MIN_APPEARANCE,
         v8_memory_min_stable_updates: int = DEFAULT_V8_MEMORY_MIN_STABLE_UPDATES,
+        v8_accept_min_initial_anchor: float = DEFAULT_V8_ACCEPT_MIN_INITIAL_ANCHOR,
+        v8_accept_min_identity_margin: float = DEFAULT_V8_ACCEPT_MIN_IDENTITY_MARGIN,
+        v8_memory_min_initial_anchor: float = DEFAULT_V8_MEMORY_MIN_INITIAL_ANCHOR,
+        v8_memory_min_identity_margin: float = DEFAULT_V8_MEMORY_MIN_IDENTITY_MARGIN,
         v8_window_penalty_ratio: float = DEFAULT_V8_WINDOW_PENALTY_RATIO,
     ) -> None:
         self.lorat_root = lorat_root.resolve()
@@ -1236,8 +1268,8 @@ class V8QualityBatchedLoRATTracker:
         self.sequence_name = sequence_name
         self.disable_amp = bool(disable_amp)
         self.frame_size_override = max(0, int(frame_size))
-        self.lorat_memory_slots = max(1, min(v5.MAX_LORAT_MEMORY_SLOTS, int(lorat_memory_slots)))
-        self.head_rank = max(1, min(v5.MAX_LORAT_MEMORY_SLOTS, int(head_rank or self.lorat_memory_slots)))
+        self.lorat_memory_slots = max(1, min(mot.MAX_LORAT_MEMORY_SLOTS, int(lorat_memory_slots)))
+        self.head_rank = max(1, min(mot.MAX_LORAT_MEMORY_SLOTS, int(head_rank or self.lorat_memory_slots)))
         self.head_hidden_dim = max(16, int(head_hidden_dim))
         self.head_lora_rank = max(1, int(head_lora_rank))
         self.head_weight_path = head_weight_path.resolve() if head_weight_path is not None else None
@@ -1308,20 +1340,24 @@ class V8QualityBatchedLoRATTracker:
         self.v8_memory_min_path = max(0.0, min(1.0, float(v8_memory_min_path)))
         self.v8_memory_min_appearance = max(0.0, min(1.0, float(v8_memory_min_appearance)))
         self.v8_memory_min_stable_updates = max(1, int(v8_memory_min_stable_updates))
+        self.v8_accept_min_initial_anchor = max(0.0, min(1.0, float(v8_accept_min_initial_anchor)))
+        self.v8_accept_min_identity_margin = float(v8_accept_min_identity_margin)
+        self.v8_memory_min_initial_anchor = max(0.0, min(1.0, float(v8_memory_min_initial_anchor)))
+        self.v8_memory_min_identity_margin = float(v8_memory_min_identity_margin)
         self.v8_window_penalty_ratio = max(0.0, min(1.0, float(v8_window_penalty_ratio)))
         self.v8_template_match_attempts = 0
         self.v8_template_match_hits = 0
         self.v8_template_fused_candidates = 0
         self.v8_template_preferred_candidates = 0
 
-        self.tracks: List[v5.TrackState] = []
-        self.track_by_id: Dict[int, v5.TrackState] = {}
+        self.tracks: List[mot.TrackState] = []
+        self.track_by_id: Dict[int, mot.TrackState] = {}
         self.next_track_id = 1
         self.closed = False
         self.using_directml = False
         self.device_label = self.device_string
         self.gpu_name = ""
-        self.runtime_status = v5.RuntimeStatus()
+        self.runtime_status = mot.RuntimeStatus()
         self.slot_debug_lines: List[str] = []
         self.week2_proof_lines: List[str] = []
         self.last_candidate_diagnostics: List[Dict[str, object]] = []
@@ -1612,13 +1648,13 @@ class V8QualityBatchedLoRATTracker:
         proof_elapsed_ms = (time.perf_counter() - proof_started) * 1000.0
         fields = [
             str(frame_number),
-            v5.csv_text(phase),
-            v5.csv_text(V8_EXECUTION_MODE),
-            v5.csv_text(self._last_head_mode),
+            mot.csv_text(phase),
+            mot.csv_text(V8_EXECUTION_MODE),
+            mot.csv_text(self._last_head_mode),
             str(tracked_objects_this_frame),
             str(status.active_objects),
-            v5.csv_float(status.last_frame_seconds),
-            v5.csv_float(status.fps),
+            mot.csv_float(status.last_frame_seconds),
+            mot.csv_float(status.fps),
             str(backbone_delta),
             str(head_batch_delta),
             str(head_item_delta),
@@ -1628,27 +1664,27 @@ class V8QualityBatchedLoRATTracker:
             str(status.object_head_items),
             str(status.gating_selected_slot_items),
             str(status.max_object_head_batch),
-            v5.csv_float(self._last_backbone_seconds * 1000.0),
-            v5.csv_float(self._last_head_seconds * 1000.0),
+            mot.csv_float(self._last_backbone_seconds * 1000.0),
+            mot.csv_float(self._last_head_seconds * 1000.0),
             str(self._last_roi_tokens),
-            v5.csv_float(self._profile_ms("candidate_transfer")),
-            v5.csv_float(self._profile_ms("candidate_extract")),
-            v5.csv_float(self._profile_ms("template_match")),
-            v5.csv_float(self._profile_ms("candidate_fusion")),
-            v5.csv_float(self._profile_ms("reid_appearance")),
-            v5.csv_float(self._profile_ms("identity_resolve")),
-            v5.csv_float(self._profile_ms("identity_score")),
-            v5.csv_float(self._profile_ms("debug_output")),
-            v5.csv_float(self._profile_ms("accept")),
-            v5.csv_float(self._profile_ms("hold")),
-            v5.csv_float(self._profile_ms("appearance_refresh")),
-            v5.csv_float(proof_elapsed_ms),
-            v5.csv_float(unbucketed_seconds * 1000.0),
-            v5.csv_text(status.gpu_name),
-            v5.csv_float(status.gpu_allocated_mb),
-            v5.csv_float(status.gpu_reserved_mb),
-            v5.csv_float(status.gpu_peak_allocated_mb),
-            v5.csv_float(status.gpu_peak_reserved_mb),
+            mot.csv_float(self._profile_ms("candidate_transfer")),
+            mot.csv_float(self._profile_ms("candidate_extract")),
+            mot.csv_float(self._profile_ms("template_match")),
+            mot.csv_float(self._profile_ms("candidate_fusion")),
+            mot.csv_float(self._profile_ms("reid_appearance")),
+            mot.csv_float(self._profile_ms("identity_resolve")),
+            mot.csv_float(self._profile_ms("identity_score")),
+            mot.csv_float(self._profile_ms("debug_output")),
+            mot.csv_float(self._profile_ms("accept")),
+            mot.csv_float(self._profile_ms("hold")),
+            mot.csv_float(self._profile_ms("appearance_refresh")),
+            mot.csv_float(proof_elapsed_ms),
+            mot.csv_float(unbucketed_seconds * 1000.0),
+            mot.csv_text(status.gpu_name),
+            mot.csv_float(status.gpu_allocated_mb),
+            mot.csv_float(status.gpu_reserved_mb),
+            mot.csv_float(status.gpu_peak_allocated_mb),
+            mot.csv_float(status.gpu_peak_reserved_mb),
             "1" if self._last_frame_week2_shared_ok else "0",
             "1" if self._last_frame_week2_head_ok else "0",
         ]
@@ -1672,7 +1708,7 @@ class V8QualityBatchedLoRATTracker:
         if self.collect_week2_proof:
             self._append_week2_proof_row(frame_number, "initialize", 0, before)
 
-    def add_tracks(self, frame: np.ndarray, boxes: Sequence[BBox], frame_number: int) -> List[v5.TrackState]:
+    def add_tracks(self, frame: np.ndarray, boxes: Sequence[BBox], frame_number: int) -> List[mot.TrackState]:
         if self.max_tracks > 0:
             remaining = max(0, self.max_tracks - len(self.tracks))
             boxes = boxes[:remaining]
@@ -1698,8 +1734,8 @@ class V8QualityBatchedLoRATTracker:
         feature_map,
         bbox: BBox,
         frame_number: int,
-    ) -> v5.TrackState:
-        clipped = v5.clamp_bbox_to_frame_bounds(frame, bbox)
+    ) -> mot.TrackState:
+        clipped = mot.clamp_bbox_to_frame_bounds(frame, bbox)
         initial_slot = self._template_slot_for_bbox(
             feature_map,
             clipped,
@@ -1710,13 +1746,13 @@ class V8QualityBatchedLoRATTracker:
             self._siamfc_context_bbox(clipped, 2.0),
         )
         head_vector = initial_slot.vector
-        track = v5.TrackState(
+        track = mot.TrackState(
             track_id=self.next_track_id,
             bbox=clipped,
             previous_bbox=clipped,
             predicted_bbox=clipped,
             raw_bbox=clipped,
-            color=v5.color_for_track(self.next_track_id),
+            color=mot.color_for_track(self.next_track_id),
             confidence=1.0,
             raw_confidence=1.0,
             confidence_baseline=1.0,
@@ -1726,9 +1762,9 @@ class V8QualityBatchedLoRATTracker:
             active_lorat_slot="initial",
             lorat_memory_slot_count=1,
             initial_bbox=clipped,
-            trusted_size_bank=[v5.clamp_bbox_size(clipped)],
+            trusted_size_bank=[mot.clamp_bbox_size(clipped)],
             appearance_updates=1,
-            kalman=v5.BBoxKalmanFilter(clipped),
+            kalman=mot.BBoxKalmanFilter(clipped),
             last_reliable_bbox=clipped,
             last_reliable_frame=frame_number,
         )
@@ -1737,16 +1773,17 @@ class V8QualityBatchedLoRATTracker:
         setattr(track, "v8_appearance_feature", initial_feature.detach().clone())
         setattr(track, "v8_feature_bank", [initial_feature.detach().clone()])
         setattr(track, "v8_stable_update_streak", 0)
-        track.size_history = [(frame_number, v5.clamp_bbox_size(clipped))]
+        mot.set_track_lifecycle(track, mot.TrackLifecycle.HEALTHY)
+        track.size_history = [(frame_number, mot.clamp_bbox_size(clipped))]
         self._set_track_head_bank(track, [initial_slot])
-        v5.record_track_trajectory(track, frame_number, clipped, self.trajectory_history_size)
-        v5.record_reliable_track_trajectory(track, frame_number, clipped, self.trajectory_history_size)
+        mot.record_track_trajectory(track, frame_number, clipped, self.trajectory_history_size)
+        mot.record_reliable_track_trajectory(track, frame_number, clipped, self.trajectory_history_size)
         self.tracks.append(track)
         self.track_by_id[track.track_id] = track
         self.next_track_id += 1
         return track
 
-    def update(self, frame: np.ndarray, frame_number: int) -> Sequence[v5.TrackState]:
+    def update(self, frame: np.ndarray, frame_number: int) -> Sequence[mot.TrackState]:
         frame_started = time.perf_counter()
         before = self._week2_counter_snapshot()
         self.last_candidate_diagnostics = []
@@ -1756,21 +1793,32 @@ class V8QualityBatchedLoRATTracker:
         self._last_roi_tokens = 0
         self._last_selected_head_count = 0
         feature_map = self._encode_frame(frame)
-        active_tracks = [track for track in self.tracks if track.ok]
-        tracked_objects_this_frame = len(active_tracks)
-        if active_tracks:
-            self._score_and_update_tracks(frame, feature_map, active_tracks, frame_number)
+        evaluated_tracks = self._tracks_for_frame_update()
+        tracked_objects_this_frame = len(evaluated_tracks)
+        if evaluated_tracks:
+            self._score_and_update_tracks(frame, feature_map, evaluated_tracks, frame_number)
 
         self._record_frame_status(time.perf_counter() - frame_started)
         if self.collect_week2_proof:
             self._append_week2_proof_row(frame_number, "track", tracked_objects_this_frame, before)
         return self.tracks
 
+    def _tracks_for_frame_update(self) -> List[mot.TrackState]:
+        """Return visible and lost-but-recoverable tracks for the frame-level V8 pass."""
+        tracks: List[mot.TrackState] = []
+        for track in self.tracks:
+            if track.ok:
+                tracks.append(track)
+                continue
+            if track.lost_frames > 0 and self._get_track_head_bank(track):
+                tracks.append(track)
+        return tracks
+
     def _score_and_update_tracks(
         self,
         frame: np.ndarray,
         feature_map,
-        tracks: Sequence[v5.TrackState],
+        tracks: Sequence[mot.TrackState],
         frame_number: int,
     ) -> None:
         selected_banks = [self._select_track_heads(track, frame_number) for track in tracks]
@@ -1798,7 +1846,7 @@ class V8QualityBatchedLoRATTracker:
         total_roi_tokens = 0
         records: Dict[int, Dict[str, object]] = {}
         diagnostics_by_track_id: Dict[int, Dict[str, object]] = {}
-        candidate_outputs: List[v5.LoRATSlotOutput] = []
+        candidate_outputs: List[mot.LoRATSlotOutput] = []
         for index, track in enumerate(tracks):
             predicted = predicted_bboxes[index]
             candidate_info = candidate_infos[index]
@@ -1834,7 +1882,7 @@ class V8QualityBatchedLoRATTracker:
             self._add_profile_seconds("candidate_fusion", time.perf_counter() - fusion_started)
             total_roi_tokens += roi_tokens
             slot = self._synthetic_head_slot(track, frame_number)
-            output = v5.LoRATSlotOutput(
+            output = mot.LoRATSlotOutput(
                 source_track_id=track.track_id,
                 slot=slot,
                 bbox=candidate,
@@ -1912,7 +1960,7 @@ class V8QualityBatchedLoRATTracker:
                         output,  # type: ignore[arg-type]
                     )
                     self._add_profile_seconds("identity_score", time.perf_counter() - score_started)
-                    identity_assignment = v5.IdentityAssignment(
+                    identity_assignment = mot.IdentityAssignment(
                         track=track,
                         output=output,  # type: ignore[arg-type]
                         score=score,
@@ -1993,7 +2041,7 @@ class V8QualityBatchedLoRATTracker:
         self.runtime_status.object_head_roi_tokens += total_roi_tokens
         self.last_candidate_diagnostics = list(diagnostics_by_track_id.values())
 
-    def _select_track_heads(self, track: v5.TrackState, frame_number: int) -> List[object]:
+    def _select_track_heads(self, track: mot.TrackState, frame_number: int) -> List[object]:
         head_bank = self._get_track_head_bank(track)
         if not head_bank:
             self._record_v8_gating([], [])
@@ -2009,7 +2057,7 @@ class V8QualityBatchedLoRATTracker:
         self._record_v8_gating(selected, reasons)
         return selected
 
-    def _select_primary_heads(self, track: v5.TrackState, head_bank: Sequence[object], limit: int) -> List[object]:
+    def _select_primary_heads(self, track: mot.TrackState, head_bank: Sequence[object], limit: int) -> List[object]:
         if limit <= 0:
             return []
         selected: List[object] = []
@@ -2021,15 +2069,15 @@ class V8QualityBatchedLoRATTracker:
                 return
             selected.append(vector)
 
-        add(head_bank[-1])
         add(head_bank[0])
+        add(head_bank[-1])
         for vector in reversed(head_bank[1:]):
             add(vector)
         return selected
 
     def _select_recovery_heads(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         head_bank: Sequence[object],
         frame_number: int,
         limit: int,
@@ -2059,7 +2107,7 @@ class V8QualityBatchedLoRATTracker:
 
     def _v8_recovery_reasons(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         head_bank: Sequence[object],
         frame_number: int,
     ) -> List[str]:
@@ -2104,8 +2152,8 @@ class V8QualityBatchedLoRATTracker:
         else:
             self.v8_primary_decisions += 1
 
-    def _synthetic_head_slot(self, track: v5.TrackState, frame_number: int) -> v5.LoRATMemorySlot:
-        return v5.LoRATMemorySlot(
+    def _synthetic_head_slot(self, track: mot.TrackState, frame_number: int) -> mot.LoRATMemorySlot:
+        return mot.LoRATMemorySlot(
             task_id=(track.track_id * 1_000_000) + frame_number,
             track_id=track.track_id,
             label=str(track.active_lorat_slot or "V8-head"),
@@ -2123,8 +2171,8 @@ class V8QualityBatchedLoRATTracker:
     def _append_head_debug_rows(
         self,
         frame_number: int,
-        evaluated_tracks: Sequence[v5.TrackState],
-        candidate_outputs: Sequence[v5.LoRATSlotOutput],
+        evaluated_tracks: Sequence[mot.TrackState],
+        candidate_outputs: Sequence[mot.LoRATSlotOutput],
     ) -> None:
         if not evaluated_tracks or not candidate_outputs:
             return
@@ -2141,50 +2189,50 @@ class V8QualityBatchedLoRATTracker:
             fields = [
                 str(frame_number),
                 str(track.track_id),
-                v5.csv_text(output.slot.label),
+                mot.csv_text(output.slot.label),
                 str(output.slot.task_id),
                 str(output.slot.frame_number),
                 str(output.slot.anchor_frame_number),
                 str(output.slot.last_refresh_frame),
                 "1" if output.slot.active else "0",
-                v5.csv_text(track.active_lorat_slot),
-                v5.csv_float(output.confidence),
-                v5.csv_float(output.confidence),
-                v5.csv_float(output.slot.confidence_baseline),
-                v5.csv_float(track.confidence_baseline),
-                *v5.csv_bbox(output.bbox),
-                *v5.csv_bbox(track.bbox),
-                *v5.csv_bbox(track.predicted_bbox),
-                v5.csv_float(score.total),
-                v5.csv_float(score.appearance),
-                v5.csv_float(score.motion),
-                v5.csv_float(score.path),
-                v5.csv_float(score.source),
-                v5.csv_float(score.confidence),
-                v5.csv_float(score.iou),
-                v5.csv_float(score.initial_anchor),
-                v5.csv_float(score.other_anchor),
+                mot.csv_text(track.active_lorat_slot),
+                mot.csv_float(output.confidence),
+                mot.csv_float(output.confidence),
+                mot.csv_float(output.slot.confidence_baseline),
+                mot.csv_float(track.confidence_baseline),
+                *mot.csv_bbox(output.bbox),
+                *mot.csv_bbox(track.bbox),
+                *mot.csv_bbox(track.predicted_bbox),
+                mot.csv_float(score.total),
+                mot.csv_float(score.appearance),
+                mot.csv_float(score.motion),
+                mot.csv_float(score.path),
+                mot.csv_float(score.source),
+                mot.csv_float(score.confidence),
+                mot.csv_float(score.iou),
+                mot.csv_float(score.initial_anchor),
+                mot.csv_float(score.other_anchor),
                 str(score.other_track_id) if score.other_track_id is not None else "",
-                v5.csv_float(score.identity_margin),
+                mot.csv_float(score.identity_margin),
                 str(score.occlusion_track_id) if score.occlusion_track_id is not None else "",
-                v5.csv_float(score.occlusion_iou),
+                mot.csv_float(score.occlusion_iou),
             ]
             self.slot_debug_lines.append(",".join(fields) + "\n")
 
-    def _predict_track(self, track: v5.TrackState) -> BBox:
+    def _predict_track(self, track: mot.TrackState) -> BBox:
         track.previous_bbox = track.bbox
         if track.kalman is not None:
             predicted = track.kalman.predict()
         else:
-            predicted = v5.predict_bbox(track.bbox, track.velocity)
+            predicted = mot.predict_bbox(track.bbox, track.velocity)
         track.predicted_bbox = predicted
         return predicted
 
     @staticmethod
-    def _head_decode_reference_size(track: v5.TrackState) -> Tuple[float, float]:
+    def _head_decode_reference_size(track: mot.TrackState) -> Tuple[float, float]:
         samples: List[BBox] = []
         if track.trusted_size_bank:
-            samples.extend(track.trusted_size_bank[-v5.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE:])
+            samples.extend(track.trusted_size_bank[-mot.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE:])
         if track.last_reliable_bbox is not None:
             samples.append(track.last_reliable_bbox)
         if track.initial_bbox is not None:
@@ -2200,7 +2248,7 @@ class V8QualityBatchedLoRATTracker:
         score_maps,
         box_delta_maps,
         predicted_bboxes: Sequence[BBox],
-        tracks: Sequence[v5.TrackState],
+        tracks: Sequence[mot.TrackState],
         frame_shape: Tuple[int, ...],
     ) -> List[V8HeadCandidateInfo]:
         candidate_started = time.perf_counter()
@@ -2382,7 +2430,7 @@ class V8QualityBatchedLoRATTracker:
             if roi_tokens <= 0:
                 candidates.append(
                     V8HeadCandidateInfo(
-                        bbox=v5.clamp_bbox_size(predicted),
+                        bbox=mot.clamp_bbox_size(predicted),
                         confidence=0.0,
                         margin=0.0,
                         roi_tokens=0,
@@ -2405,7 +2453,7 @@ class V8QualityBatchedLoRATTracker:
                 ) = top_row
                 if float(top_finite) <= 0.0:
                     continue
-                top_bbox = v5.clamp_bbox_size((top_x, top_y, top_w, top_h))
+                top_bbox = mot.clamp_bbox_size((top_x, top_y, top_w, top_h))
                 top_candidates.append(
                     V8HeadCandidate(
                         rank=rank,
@@ -2415,7 +2463,7 @@ class V8QualityBatchedLoRATTracker:
                         grid_y=int(np.clip(round(float(top_grid_y_value)), 0, max(0, grid_height - 1))),
                     )
                 )
-            candidate = v5.clamp_bbox_size((bbox_x, bbox_y, bbox_w, bbox_h))
+            candidate = mot.clamp_bbox_size((bbox_x, bbox_y, bbox_w, bbox_h))
             candidates.append(
                 V8HeadCandidateInfo(
                     bbox=candidate,
@@ -2433,7 +2481,7 @@ class V8QualityBatchedLoRATTracker:
         self,
         feature_map,
         frame_shape: Tuple[int, ...],
-        track: v5.TrackState,
+        track: mot.TrackState,
         predicted: BBox,
         candidate_info: V8HeadCandidateInfo,
     ) -> V8HeadCandidateInfo:
@@ -2441,7 +2489,7 @@ class V8QualityBatchedLoRATTracker:
         if len(top_candidates) <= 1:
             return candidate_info
 
-        reference_diagonal = max(1.0, v5.bbox_diagonal(track.bbox))
+        reference_diagonal = max(1.0, mot.bbox_diagonal(track.bbox))
         best_confidence = max(float(candidate.confidence) for candidate in top_candidates)
         kept_candidates: List[V8HeadCandidate] = []
         feature_vectors = []
@@ -2463,9 +2511,9 @@ class V8QualityBatchedLoRATTracker:
         for candidate, appearance in zip(kept_candidates, appearance_scores.tolist()):
             confidence = float(candidate.confidence)
             bbox = candidate.bbox
-            motion = v5.motion_affinity(predicted, bbox, reference_diagonal)
-            path = v5.center_path_affinity(track, bbox)
-            continuity = max(v5.bbox_iou(track.bbox, bbox), v5.bbox_iou(predicted, bbox))
+            motion = mot.motion_affinity(predicted, bbox, reference_diagonal)
+            path = mot.center_path_affinity(track, bbox)
+            continuity = max(mot.bbox_iou(track.bbox, bbox), mot.bbox_iou(predicted, bbox))
             score = (
                 (0.42 * confidence)
                 + (0.22 * motion)
@@ -2495,8 +2543,8 @@ class V8QualityBatchedLoRATTracker:
 
     def _apply_identity_scores(
         self,
-        track: v5.TrackState,
-        identity_assignment: Optional[v5.IdentityAssignment],
+        track: mot.TrackState,
+        identity_assignment: Optional[mot.IdentityAssignment],
         fallback_confidence: float,
         fallback_margin: float,
     ) -> None:
@@ -2522,10 +2570,10 @@ class V8QualityBatchedLoRATTracker:
 
     def _candidate_reject_state(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         bbox: BBox,
         confidence: float,
-        identity_assignment: Optional[v5.IdentityAssignment],
+        identity_assignment: Optional[mot.IdentityAssignment],
         candidate_source: str = "head",
     ) -> Optional[str]:
         if candidate_source == "template" and track.lost_frames <= 0:
@@ -2546,8 +2594,11 @@ class V8QualityBatchedLoRATTracker:
         )
         if self._is_initial_anchor_steal(score):
             return "OTHERID"
+        anchor_reject = self._anchor_identity_reject_state(track, identity_assignment, memory_gate=False)
+        if anchor_reject is not None:
+            return anchor_reject
         if (
-            v5.path_gate_ready(track)
+            mot.path_gate_ready(track)
             and score.path < self.identity_arbitrator.min_path
             and not is_view_change
             and not self._is_path_recovery(track, confidence, identity_assignment)
@@ -2566,53 +2617,97 @@ class V8QualityBatchedLoRATTracker:
         return None
 
     @staticmethod
-    def _is_initial_anchor_steal(score: v5.IdentityScore) -> bool:
+    def _is_initial_anchor_steal(score: mot.IdentityScore) -> bool:
         return (
             score.other_track_id is not None
-            and score.occlusion_iou >= v5.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_IOU
-            and score.other_anchor >= v5.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_OTHER
-            and score.identity_margin <= -v5.DEFAULT_IDENTITY_ANCHOR_STEAL_MARGIN
+            and score.occlusion_iou >= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_IOU
+            and score.other_anchor >= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_OTHER
+            and score.identity_margin <= -mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MARGIN
         )
+
+    def _anchor_identity_reject_state(
+        self,
+        track: mot.TrackState,
+        identity_assignment: Optional[mot.IdentityAssignment],
+        *,
+        memory_gate: bool,
+    ) -> Optional[str]:
+        if identity_assignment is None or getattr(track, "v8_initial_feature", None) is None:
+            return None
+        score = identity_assignment.score
+        is_view_change = self.identity_arbitrator.is_view_change_candidate(
+            track,
+            identity_assignment.output,
+            score,
+        )
+        if is_view_change:
+            return None
+
+        if memory_gate:
+            if score.initial_anchor < self.v8_memory_min_initial_anchor:
+                return "MEMANCHORLOW"
+            if (
+                score.other_track_id is not None
+                and score.other_anchor >= 0.55
+                and score.identity_margin < self.v8_memory_min_identity_margin
+            ):
+                return "MEMANCHORAMBIG"
+            return None
+
+        if score.initial_anchor < self.v8_accept_min_initial_anchor and score.appearance < max(
+            self.identity_arbitrator.min_reid,
+            self.v8_accept_min_initial_anchor,
+        ):
+            return "ANCHORLOW"
+        if (
+            score.other_track_id is not None
+            and score.other_anchor >= max(0.60, score.initial_anchor + 0.04)
+            and score.identity_margin < self.v8_accept_min_identity_margin
+        ):
+            return "ANCHORAMBIG"
+        return None
 
     def _is_path_recovery(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         confidence_value: float,
-        identity_assignment: Optional[v5.IdentityAssignment],
+        identity_assignment: Optional[mot.IdentityAssignment],
     ) -> bool:
-        if identity_assignment is None or track.lost_frames < v5.DEFAULT_PATH_RECOVERY_AFTER_FRAMES:
+        if identity_assignment is None or track.lost_frames < mot.DEFAULT_PATH_RECOVERY_AFTER_FRAMES:
             return False
         score = identity_assignment.score
         return (
             identity_assignment.output.source_track_id == track.track_id
-            and confidence_value >= v5.DEFAULT_PATH_RECOVERY_MIN_CONFIDENCE
-            and score.appearance >= v5.DEFAULT_PATH_RECOVERY_MIN_REID
-            and score.motion >= v5.DEFAULT_PATH_RECOVERY_MIN_MOTION
+            and confidence_value >= mot.DEFAULT_PATH_RECOVERY_MIN_CONFIDENCE
+            and score.appearance >= mot.DEFAULT_PATH_RECOVERY_MIN_REID
+            and score.motion >= mot.DEFAULT_PATH_RECOVERY_MIN_MOTION
             and score.total >= self.identity_arbitrator.min_score
         )
 
     def _is_reid_recovery(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         confidence_value: float,
-        identity_assignment: Optional[v5.IdentityAssignment],
+        identity_assignment: Optional[mot.IdentityAssignment],
     ) -> bool:
         if identity_assignment is None or track.lost_frames <= 0:
             return False
         score = identity_assignment.score
+        anchor_reject = self._anchor_identity_reject_state(track, identity_assignment, memory_gate=False)
         return (
             confidence_value >= self.reid_recovery_min_confidence
             and score.total >= self.reid_recovery_min_score
             and score.appearance >= self.reid_recovery_min_reid
+            and anchor_reject is None
             and score.motion >= self.reid_recovery_min_motion
             and (score.path >= self.identity_arbitrator.min_path or self._is_path_recovery(track, confidence_value, identity_assignment))
         )
 
     def _learning_evidence_is_strong(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         confidence: float,
-        identity_assignment: Optional[v5.IdentityAssignment],
+        identity_assignment: Optional[mot.IdentityAssignment],
     ) -> bool:
         if confidence < self.shrink_guard_min_confidence:
             return False
@@ -2622,18 +2717,18 @@ class V8QualityBatchedLoRATTracker:
 
     def _assess_learning_hold(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         bbox: BBox,
         confidence: float,
-        identity_assignment: Optional[v5.IdentityAssignment],
+        identity_assignment: Optional[mot.IdentityAssignment],
         frame: Optional[np.ndarray],
-    ) -> Tuple[bool, List[str], v5.CropInformation, float, float, int]:
-        crop_info = v5.measure_crop_information(frame, bbox, self.crop_information_min_pixels)
-        previous_area = v5.bbox_area(track.bbox)
-        current_area = v5.bbox_area(bbox)
+    ) -> Tuple[bool, List[str], mot.CropInformation, float, float, int]:
+        crop_info = mot.measure_crop_information(frame, bbox, self.crop_information_min_pixels)
+        previous_area = mot.bbox_area(track.bbox)
+        current_area = mot.bbox_area(bbox)
         step_ratio = current_area / max(1.0, previous_area)
         recent_history = track.size_history[-self.shrink_guard_window :] if self.shrink_guard_window > 0 else []
-        reference_area = max([previous_area] + [v5.bbox_area(sample_bbox) for _, sample_bbox in recent_history])
+        reference_area = max([previous_area] + [mot.bbox_area(sample_bbox) for _, sample_bbox in recent_history])
         window_ratio = current_area / max(1.0, reference_area)
         projected_shrink_frames = track.shrink_risk_frames + 1 if step_ratio < 0.995 else 0
 
@@ -2652,17 +2747,17 @@ class V8QualityBatchedLoRATTracker:
             reasons.append("SHRINKRISK")
         return bool(reasons), reasons, crop_info, step_ratio, window_ratio, projected_shrink_frames
 
-    def _trusted_size_floor(self, track: v5.TrackState) -> Optional[Tuple[float, float]]:
+    def _trusted_size_floor(self, track: mot.TrackState) -> Optional[Tuple[float, float]]:
         if self.lorat_trusted_size_floor_scale <= 0:
             return None
         initial_floor: Optional[Tuple[float, float]] = None
         if track.initial_bbox is not None:
-            _, _, initial_w, initial_h = v5.clamp_bbox_size(track.initial_bbox)
+            _, _, initial_w, initial_h = mot.clamp_bbox_size(track.initial_bbox)
             initial_floor = (
                 max(1.0, initial_w * self.lorat_trusted_size_floor_scale),
                 max(1.0, initial_h * self.lorat_trusted_size_floor_scale),
             )
-        samples = list(track.trusted_size_bank[-v5.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE:])
+        samples = list(track.trusted_size_bank[-mot.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE:])
         if not samples:
             return initial_floor
         widths = np.asarray([max(1.0, float(sample[2])) for sample in samples], dtype=np.float32)
@@ -2675,32 +2770,32 @@ class V8QualityBatchedLoRATTracker:
             return memory_floor
         return max(initial_floor[0], memory_floor[0]), max(initial_floor[1], memory_floor[1])
 
-    def _apply_trusted_size_floor(self, track: v5.TrackState, bbox: BBox, frame: Optional[np.ndarray]) -> Tuple[BBox, bool]:
-        x, y, w, h = v5.clamp_bbox_size(bbox)
+    def _apply_trusted_size_floor(self, track: mot.TrackState, bbox: BBox, frame: Optional[np.ndarray]) -> Tuple[BBox, bool]:
+        x, y, w, h = mot.clamp_bbox_size(bbox)
         floor = self._trusted_size_floor(track)
         if floor is None:
-            return v5.clamp_bbox_to_frame_bounds(frame, (x, y, w, h)), False
+            return mot.clamp_bbox_to_frame_bounds(frame, (x, y, w, h)), False
         min_w, min_h = floor
         if w >= min_w and h >= min_h:
-            return v5.clamp_bbox_to_frame_bounds(frame, (x, y, w, h)), False
-        center_x, center_y = v5.bbox_center((x, y, w, h))
+            return mot.clamp_bbox_to_frame_bounds(frame, (x, y, w, h)), False
+        center_x, center_y = mot.bbox_center((x, y, w, h))
         guarded_w = max(w, min_w)
         guarded_h = max(h, min_h)
         return (
-            v5.clamp_bbox_to_frame_bounds(
+            mot.clamp_bbox_to_frame_bounds(
                 frame,
                 (center_x - (guarded_w / 2.0), center_y - (guarded_h / 2.0), guarded_w, guarded_h),
             ),
             True,
         )
 
-    def _apply_fixed_box_size(self, track: v5.TrackState, bbox: BBox, frame: Optional[np.ndarray]) -> Tuple[BBox, bool]:
+    def _apply_fixed_box_size(self, track: mot.TrackState, bbox: BBox, frame: Optional[np.ndarray]) -> Tuple[BBox, bool]:
         if not self.lorat_fixed_box_size or track.initial_bbox is None:
-            return v5.clamp_bbox_to_frame_bounds(frame, bbox), False
-        _, _, fixed_w, fixed_h = v5.clamp_bbox_size(track.initial_bbox)
-        x, y, w, h = v5.clamp_bbox_size(bbox)
-        center_x, center_y = v5.bbox_center((x, y, w, h))
-        fixed = v5.clamp_bbox_to_frame_bounds(
+            return mot.clamp_bbox_to_frame_bounds(frame, bbox), False
+        _, _, fixed_w, fixed_h = mot.clamp_bbox_size(track.initial_bbox)
+        x, y, w, h = mot.clamp_bbox_size(bbox)
+        center_x, center_y = mot.bbox_center((x, y, w, h))
+        fixed = mot.clamp_bbox_to_frame_bounds(
             frame,
             (center_x - (fixed_w / 2.0), center_y - (fixed_h / 2.0), fixed_w, fixed_h),
         )
@@ -2709,25 +2804,25 @@ class V8QualityBatchedLoRATTracker:
 
     @staticmethod
     def _scale_bbox_to_area(bbox: BBox, target_area: float, frame: Optional[np.ndarray]) -> BBox:
-        x, y, w, h = v5.clamp_bbox_size(bbox)
+        x, y, w, h = mot.clamp_bbox_size(bbox)
         scale = float(np.sqrt(max(1.0, target_area) / max(1.0, w * h)))
-        center_x, center_y = v5.bbox_center((x, y, w, h))
+        center_x, center_y = mot.bbox_center((x, y, w, h))
         scaled_w = max(1.0, w * scale)
         scaled_h = max(1.0, h * scale)
-        return v5.clamp_bbox_to_frame_bounds(
+        return mot.clamp_bbox_to_frame_bounds(
             frame,
             (center_x - (scaled_w / 2.0), center_y - (scaled_h / 2.0), scaled_w, scaled_h),
         )
 
-    def _apply_scale_limits(self, track: v5.TrackState, bbox: BBox, frame: Optional[np.ndarray]) -> Tuple[BBox, List[str]]:
-        limited = v5.clamp_bbox_to_frame_bounds(frame, bbox)
+    def _apply_scale_limits(self, track: mot.TrackState, bbox: BBox, frame: Optional[np.ndarray]) -> Tuple[BBox, List[str]]:
+        limited = mot.clamp_bbox_to_frame_bounds(frame, bbox)
         tokens: List[str] = []
-        if self.lorat_min_box_area > 0 and v5.bbox_area(limited) < self.lorat_min_box_area:
+        if self.lorat_min_box_area > 0 and mot.bbox_area(limited) < self.lorat_min_box_area:
             limited = self._scale_bbox_to_area(limited, self.lorat_min_box_area, frame)
             tokens.append("MINAREA")
         if self.lorat_max_area_change_per_frame > 1.0 and track.bbox is not None:
-            previous_area = v5.bbox_area(track.bbox)
-            current_area = v5.bbox_area(limited)
+            previous_area = mot.bbox_area(track.bbox)
+            current_area = mot.bbox_area(limited)
             min_area = max(self.lorat_min_box_area, previous_area / self.lorat_max_area_change_per_frame)
             max_area = max(min_area, previous_area * self.lorat_max_area_change_per_frame)
             target_area = min(max(current_area, min_area), max_area)
@@ -2739,20 +2834,20 @@ class V8QualityBatchedLoRATTracker:
             tokens.append("SIZEFLOOR")
         return limited, tokens
 
-    def _candidate_occlusion_info(self, track: v5.TrackState, bbox: BBox) -> Tuple[Optional[int], float]:
+    def _candidate_occlusion_info(self, track: mot.TrackState, bbox: BBox) -> Tuple[Optional[int], float]:
         if self.occlusion_iou_threshold <= 0:
             return None, 0.0
-        other_track_id, overlap = v5.strongest_track_overlap(track, bbox, self.tracks)
+        other_track_id, overlap = mot.strongest_track_overlap(track, bbox, self.tracks)
         if other_track_id is None or overlap < self.occlusion_iou_threshold:
             return None, overlap
         return other_track_id, overlap
 
     def _is_strong_memory_update(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         confidence: float,
         candidate_source: str,
-        identity_assignment: Optional[v5.IdentityAssignment],
+        identity_assignment: Optional[mot.IdentityAssignment],
         motion_score: float,
         path_score: float,
     ) -> bool:
@@ -2762,7 +2857,7 @@ class V8QualityBatchedLoRATTracker:
             return False
         if motion_score < self.v8_memory_min_motion:
             return False
-        if v5.path_gate_ready(track) and path_score < self.v8_memory_min_path:
+        if mot.path_gate_ready(track) and path_score < self.v8_memory_min_path:
             return False
         if identity_assignment is None:
             return not self.identity_arbitrator.enabled
@@ -2775,13 +2870,17 @@ class V8QualityBatchedLoRATTracker:
         )
         if identity_assignment.output.source_track_id != track.track_id and not self._is_reid_recovery(track, confidence, identity_assignment):
             return False
+        if self._is_initial_anchor_steal(score):
+            return False
+        if self._anchor_identity_reject_state(track, identity_assignment, memory_gate=True) is not None:
+            return False
         if score.total < max(self.identity_arbitrator.min_score, self.v8_recovery_min_assignment_score) and not is_view_change:
             return False
         if score.appearance < self.v8_memory_min_appearance and not is_view_change:
             return False
         if score.motion < self.v8_memory_min_motion and not is_view_change:
             return False
-        if v5.path_gate_ready(track) and score.path < self.v8_memory_min_path and not is_view_change:
+        if mot.path_gate_ready(track) and score.path < self.v8_memory_min_path and not is_view_change:
             return False
         return True
 
@@ -2789,16 +2888,16 @@ class V8QualityBatchedLoRATTracker:
         self,
         frame: np.ndarray,
         feature_map,
-        track: v5.TrackState,
+        track: mot.TrackState,
         candidate: BBox,
         confidence: float,
         margin: float,
         predicted: BBox,
         frame_number: int,
-        identity_assignment: Optional[v5.IdentityAssignment] = None,
+        identity_assignment: Optional[mot.IdentityAssignment] = None,
         candidate_source: str = "head",
     ) -> bool:
-        clipped = v5.clip_bbox_to_frame(frame, candidate)
+        clipped = mot.clip_bbox_to_frame(frame, candidate)
         if clipped is None:
             return False
         raw_bbox = tuple(float(value) for value in clipped)
@@ -2829,8 +2928,8 @@ class V8QualityBatchedLoRATTracker:
         occlusion_track_id, occlusion_iou = self._candidate_occlusion_info(track, accepted)
         candidate_occluded = occlusion_track_id is not None
         previous = track.bbox
-        motion_score = v5.motion_affinity(predicted, accepted, v5.bbox_diagonal(previous))
-        path_score = v5.center_path_affinity(track, accepted)
+        motion_score = mot.motion_affinity(predicted, accepted, mot.bbox_diagonal(previous))
+        path_score = mot.center_path_affinity(track, accepted)
         strong_memory_update = self._is_strong_memory_update(
             track,
             confidence,
@@ -2848,7 +2947,7 @@ class V8QualityBatchedLoRATTracker:
         track.raw_bbox = raw_bbox
         track.previous_bbox = previous
         track.predicted_bbox = predicted
-        track.velocity = v5.bbox_delta(previous, accepted)
+        track.velocity = mot.bbox_delta(previous, accepted)
         track.ok = True
         track.confidence = confidence
         track.raw_confidence = confidence
@@ -2884,31 +2983,32 @@ class V8QualityBatchedLoRATTracker:
 
         state = "V8HEAD" if candidate_source == "head" else f"V8HEAD-{candidate_source.upper()}"
         if identity_assignment is not None and identity_assignment.output.source_track_id != track.track_id:
-            state = v5.append_state_token(f"REID-{state}", f"SRC{identity_assignment.output.source_track_id}")
+            state = mot.append_state_token(f"REID-{state}", f"SRC{identity_assignment.output.source_track_id}")
         if fixed_size_applied:
-            state = v5.append_state_token(state, "FIXEDSIZE")
+            state = mot.append_state_token(state, "FIXEDSIZE")
         for token in scale_tokens:
-            state = v5.append_state_token(state, token)
+            state = mot.append_state_token(state, token)
         if identity_assignment is not None and self.identity_arbitrator.is_view_change_candidate(
             track,
             identity_assignment.output,
             identity_assignment.score,
         ):
-            state = v5.append_state_token(state, "VIEWCHANGE")
+            state = mot.append_state_token(state, "VIEWCHANGE")
         if self._is_reid_recovery(track, confidence, identity_assignment):
-            state = v5.append_state_token(state, "REIDRECOVERY")
+            state = mot.append_state_token(state, "REIDRECOVERY")
         if candidate_occluded:
-            state = v5.append_state_token(state, "OCCLUSION")
+            state = mot.append_state_token(state, "OCCLUSION")
         if learning_held:
-            state = v5.append_state_token(state, "NOLEARN")
+            state = mot.append_state_token(state, "NOLEARN")
             for reason in learning_hold_reasons:
-                state = v5.append_state_token(state, reason)
+                state = mot.append_state_token(state, reason)
         if not strong_memory_update:
-            state = v5.append_state_token(state, "MEMHELD")
+            state = mot.append_state_token(state, "MEMHELD")
         track.state = state
+        mot.set_track_lifecycle(track)
 
         if track.kalman is None:
-            track.kalman = v5.BBoxKalmanFilter(accepted)
+            track.kalman = mot.BBoxKalmanFilter(accepted)
         track.kalman.update(accepted, confidence)
 
         can_refresh_memory = (
@@ -2932,7 +3032,7 @@ class V8QualityBatchedLoRATTracker:
             self._commit_trusted_size(track, accepted)
             track.last_reliable_bbox = accepted
             track.last_reliable_frame = frame_number
-            v5.record_reliable_track_trajectory(track, frame_number, accepted, self.trajectory_history_size)
+            mot.record_reliable_track_trajectory(track, frame_number, accepted, self.trajectory_history_size)
             if identity_assignment is not None:
                 refresh_started = time.perf_counter()
                 self.identity_arbitrator.commit_track_memory(
@@ -2945,12 +3045,12 @@ class V8QualityBatchedLoRATTracker:
             else:
                 self._refresh_feature_appearance(track, new_head.vector)
         self._record_size_history(track, frame_number, accepted)
-        v5.record_track_trajectory(track, frame_number, accepted, self.trajectory_history_size)
+        mot.record_track_trajectory(track, frame_number, accepted, self.trajectory_history_size)
         return True
 
     def _hold_track(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         predicted: BBox,
         confidence: float,
         margin: float,
@@ -2959,19 +3059,19 @@ class V8QualityBatchedLoRATTracker:
         hold_reason: str = "",
     ) -> None:
         previous = track.bbox
-        held_bbox = v5.clamp_bbox_to_frame_bounds(frame, predicted)
+        held_bbox = mot.clamp_bbox_to_frame_bounds(frame, predicted)
         track.previous_bbox = previous
         track.predicted_bbox = held_bbox
         track.raw_bbox = held_bbox
-        track.bbox = v5.clamp_bbox_size(held_bbox)
-        track.velocity = v5.bbox_delta(previous, track.bbox)
+        track.bbox = mot.clamp_bbox_size(held_bbox)
+        track.velocity = mot.bbox_delta(previous, track.bbox)
         track.confidence = max(0.0, min(1.0, confidence))
         track.raw_confidence = confidence
         track.assignment_score = confidence
         track.assignment_margin = margin
         track.reid_score = confidence
-        track.motion_score = v5.motion_affinity(predicted, track.bbox, v5.bbox_diagonal(previous))
-        track.path_score = v5.center_path_affinity(track, track.bbox)
+        track.motion_score = mot.motion_affinity(predicted, track.bbox, mot.bbox_diagonal(previous))
+        track.path_score = mot.center_path_affinity(track, track.bbox)
         track.source_score = confidence
         track.assigned_source = "v8-kalman-hold"
         track.lost_frames += 1
@@ -2982,11 +3082,94 @@ class V8QualityBatchedLoRATTracker:
         if track.kalman is not None:
             track.kalman.state[4:] *= self.occlusion_velocity_damping
         track.ok = self.occlusion_max_frames > 0 and track.lost_frames <= self.occlusion_max_frames
-        state = v5.append_state_token("V8HEAD_MISS", "OCCLUDED") if track.ok else v5.append_state_token("V8HEAD_MISS", "LOST")
+        state = mot.append_state_token("V8HEAD_MISS", "OCCLUDED") if track.ok else mot.append_state_token("V8HEAD_MISS", "LOST")
         if hold_reason:
-            state = v5.append_state_token(state, hold_reason)
+            state = mot.append_state_token(state, hold_reason)
         track.state = state
-        v5.record_track_trajectory(track, frame_number, track.bbox, self.trajectory_history_size)
+        mot.set_track_lifecycle(track)
+        mot.record_track_trajectory(track, frame_number, track.bbox, self.trajectory_history_size)
+
+    def manual_reanchor_track(
+        self,
+        track_id: int,
+        frame: np.ndarray,
+        bbox: BBox,
+        frame_number: int,
+        seconds_spent: Optional[float] = None,
+        source: str = "manual",
+    ) -> mot.ManualReanchorEvent:
+        track = self.track_by_id.get(int(track_id))
+        if track is None:
+            raise KeyError(f"Unknown track id for manual reanchor: {track_id}")
+
+        previous_bbox = track.bbox
+        previous_state = str(track.state or "")
+        previous_lifecycle = mot.classify_track_lifecycle(track)
+        clipped = mot.clamp_bbox_to_frame_bounds(frame, bbox)
+        feature_map = self._encode_frame(frame)
+        new_head = self._template_slot_for_bbox(
+            feature_map,
+            clipped,
+            frame.shape,
+            "manual",
+            frame_number,
+            1.0,
+            self._siamfc_context_bbox(clipped, 2.0),
+        )
+
+        track.previous_bbox = previous_bbox
+        track.predicted_bbox = clipped
+        track.raw_bbox = clipped
+        track.bbox = clipped
+        track.velocity = mot.bbox_delta(previous_bbox, clipped)
+        track.ok = True
+        track.confidence = 1.0
+        track.raw_confidence = 1.0
+        track.assignment_score = 1.0
+        track.assignment_margin = 1.0
+        track.reid_score = 1.0
+        track.motion_score = 1.0
+        track.path_score = 1.0
+        track.source_score = 1.0
+        track.identity_margin = None
+        track.occlusion_track_id = None
+        track.occlusion_iou = None
+        track.assigned_source = "manual_reanchor"
+        track.lost_frames = 0
+        track.occluded_frames = 0
+        track.learning_block_reason = ""
+        track.learning_held_frames = 0
+        track.shrink_risk_frames = 0
+        track.state = "MANUAL_REANCHOR"
+        track.active_template_frame = frame_number
+        track.last_reliable_bbox = clipped
+        track.last_reliable_frame = frame_number
+        track.kalman = mot.BBoxKalmanFilter(clipped)
+        setattr(track, "v8_stable_update_streak", self.v8_memory_min_stable_updates)
+
+        bank = self._get_track_head_bank(track)
+        if bank:
+            updated_bank = [bank[0], new_head, *bank[1:]]
+        else:
+            updated_bank = [new_head]
+        self._set_track_head_bank(track, updated_bank[: self.lorat_memory_slots])
+        self._refresh_feature_appearance(track, new_head.vector)
+        self._commit_trusted_size(track, clipped)
+        self._record_size_history(track, frame_number, clipped)
+        mot.record_track_trajectory(track, frame_number, clipped, self.trajectory_history_size)
+        mot.record_reliable_track_trajectory(track, frame_number, clipped, self.trajectory_history_size)
+        mot.set_track_lifecycle(track, mot.TrackLifecycle.MANUAL_REANCHOR)
+
+        return mot.make_manual_reanchor_event(
+            frame_number,
+            track.track_id,
+            previous_bbox,
+            clipped,
+            previous_state,
+            previous_lifecycle,
+            seconds_spent=seconds_spent,
+            source=source,
+        )
 
     def _expanded_search_bbox(
         self,
@@ -2994,7 +3177,7 @@ class V8QualityBatchedLoRATTracker:
         current: BBox,
         reference_size: Optional[Tuple[float, float]] = None,
     ) -> BBox:
-        center_x, center_y = v5.bbox_center(predicted)
+        center_x, center_y = mot.bbox_center(predicted)
         _, _, current_w, current_h = current
         reference_w, reference_h = reference_size if reference_size is not None else (0.0, 0.0)
         search_w = max(current_w, predicted[2], reference_w) * self.search_radius_factor
@@ -3003,7 +3186,7 @@ class V8QualityBatchedLoRATTracker:
 
     def _bbox_to_grid_slices(self, bbox: BBox, frame_shape: Tuple[int, ...]) -> Tuple[slice, slice]:
         frame_height, frame_width = frame_shape[:2]
-        x, y, w, h = v5.clamp_bbox_size(bbox)
+        x, y, w, h = mot.clamp_bbox_size(bbox)
         left = int(np.floor((x / max(1.0, float(frame_width))) * self.grid_width))
         right = int(np.ceil(((x + w) / max(1.0, float(frame_width))) * self.grid_width))
         top = int(np.floor((y / max(1.0, float(frame_height))) * self.grid_height))
@@ -3019,7 +3202,7 @@ class V8QualityBatchedLoRATTracker:
         roi = feature_map[y_slice, x_slice]
         if roi.numel() == 0:
             frame_height, frame_width = frame_shape[:2]
-            center_x, center_y = v5.bbox_center(bbox)
+            center_x, center_y = mot.bbox_center(bbox)
             grid_x = int(np.clip((center_x / max(1.0, frame_width)) * self.grid_width, 0, self.grid_width - 1))
             grid_y = int(np.clip((center_y / max(1.0, frame_height)) * self.grid_height, 0, self.grid_height - 1))
             vector = feature_map[grid_y, grid_x]
@@ -3037,10 +3220,10 @@ class V8QualityBatchedLoRATTracker:
 
     @staticmethod
     def _siamfc_context_bbox(bbox: BBox, area_factor: float) -> BBox:
-        x, y, w, h = v5.clamp_bbox_size(bbox)
+        x, y, w, h = mot.clamp_bbox_size(bbox)
         context_w = w + (float(area_factor) - 1.0) * ((w + h) * 0.5)
         context_h = h + (float(area_factor) - 1.0) * ((w + h) * 0.5)
-        center_x, center_y = v5.bbox_center((x, y, w, h))
+        center_x, center_y = mot.bbox_center((x, y, w, h))
         return center_x - (context_w / 2.0), center_y - (context_h / 2.0), max(1.0, context_w), max(1.0, context_h)
 
     def _feature_patch_and_foreground_mask_for_bbox(
@@ -3096,13 +3279,13 @@ class V8QualityBatchedLoRATTracker:
 
     def _with_feature_appearance(
         self,
-        output: v5.LoRATSlotOutput,
+        output: mot.LoRATSlotOutput,
         feature_map,
         frame_shape: Tuple[int, ...],
-    ) -> v5.LoRATSlotOutput:
+    ) -> mot.LoRATSlotOutput:
         if getattr(output, "v8_feature", None) is not None:
             return output
-        enriched = v5.LoRATSlotOutput(
+        enriched = mot.LoRATSlotOutput(
             source_track_id=output.source_track_id,
             slot=output.slot,
             bbox=output.bbox,
@@ -3126,7 +3309,7 @@ class V8QualityBatchedLoRATTracker:
     def _feature_template_candidate(
         self,
         feature_map,
-        track: v5.TrackState,
+        track: mot.TrackState,
         predicted: BBox,
         frame_shape: Tuple[int, ...],
     ) -> Tuple[Optional[BBox], float]:
@@ -3198,18 +3381,18 @@ class V8QualityBatchedLoRATTracker:
             reference_w,
             reference_h,
         )
-        return v5.clamp_bbox_to_frame_bounds(None, candidate), max(confidence, min(1.0, confidence + max(0.0, margin) * 0.05))
+        return mot.clamp_bbox_to_frame_bounds(None, candidate), max(confidence, min(1.0, confidence + max(0.0, margin) * 0.05))
 
     def _blend_bboxes(self, primary: BBox, secondary: BBox, secondary_weight: float, frame: np.ndarray) -> BBox:
         secondary_weight = max(0.0, min(1.0, float(secondary_weight)))
         primary_weight = 1.0 - secondary_weight
-        p_center_x, p_center_y = v5.bbox_center(primary)
-        s_center_x, s_center_y = v5.bbox_center(secondary)
+        p_center_x, p_center_y = mot.bbox_center(primary)
+        s_center_x, s_center_y = mot.bbox_center(secondary)
         blended_w = (primary[2] * primary_weight) + (secondary[2] * secondary_weight)
         blended_h = (primary[3] * primary_weight) + (secondary[3] * secondary_weight)
         blended_center_x = (p_center_x * primary_weight) + (s_center_x * secondary_weight)
         blended_center_y = (p_center_y * primary_weight) + (s_center_y * secondary_weight)
-        return v5.clamp_bbox_to_frame_bounds(
+        return mot.clamp_bbox_to_frame_bounds(
             frame,
             (
                 blended_center_x - (blended_w / 2.0),
@@ -3222,7 +3405,7 @@ class V8QualityBatchedLoRATTracker:
     def _fuse_head_and_template_candidate(
         self,
         frame: np.ndarray,
-        track: v5.TrackState,
+        track: mot.TrackState,
         head_candidate: BBox,
         head_confidence: float,
         head_margin: float,
@@ -3234,12 +3417,12 @@ class V8QualityBatchedLoRATTracker:
         self.v8_template_match_hits += 1
 
         predicted = track.predicted_bbox or track.bbox
-        reference_diagonal = max(1.0, v5.bbox_diagonal(track.bbox))
-        head_motion = v5.motion_affinity(predicted, head_candidate, reference_diagonal)
-        template_motion = v5.motion_affinity(predicted, template_candidate, reference_diagonal)
-        head_path = v5.center_path_affinity(track, head_candidate)
-        template_path = v5.center_path_affinity(track, template_candidate)
-        head_template_iou = v5.bbox_iou(head_candidate, template_candidate)
+        reference_diagonal = max(1.0, mot.bbox_diagonal(track.bbox))
+        head_motion = mot.motion_affinity(predicted, head_candidate, reference_diagonal)
+        template_motion = mot.motion_affinity(predicted, template_candidate, reference_diagonal)
+        head_path = mot.center_path_affinity(track, head_candidate)
+        template_path = mot.center_path_affinity(track, template_candidate)
+        head_template_iou = mot.bbox_iou(head_candidate, template_candidate)
         head_is_uncertain = head_confidence < self.min_confidence or head_margin < self.v8_template_match_margin_gate
         template_is_strong = (
             template_confidence >= max(self.v8_template_match_min_score, head_confidence + self.v8_template_match_prefer_margin)
@@ -3272,7 +3455,7 @@ class V8QualityBatchedLoRATTracker:
         fused_margin = max(head_margin, abs(template_confidence - head_confidence))
         return fused, fused_confidence, fused_margin, "fused-template"
 
-    def _set_track_head_bank(self, track: v5.TrackState, bank) -> None:
+    def _set_track_head_bank(self, track: mot.TrackState, bank) -> None:
         slots: List[V8TemplateMemorySlot] = []
         for index, item in enumerate(bank[: self.lorat_memory_slots]):
             if isinstance(item, V8TemplateMemorySlot):
@@ -3302,7 +3485,7 @@ class V8QualityBatchedLoRATTracker:
         track.lorat_memory_slot_count = len(self._get_track_head_bank(track))
 
     @staticmethod
-    def _get_track_head_bank(track: v5.TrackState):
+    def _get_track_head_bank(track: mot.TrackState):
         return list(getattr(track, "v8_head_bank", []))
 
     def _renumber_head_bank(self, bank: Sequence[V8TemplateMemorySlot]) -> List[V8TemplateMemorySlot]:
@@ -3320,7 +3503,7 @@ class V8QualityBatchedLoRATTracker:
             )
         return renumbered
 
-    def _refresh_track_head_bank(self, track: v5.TrackState, slot_or_vector, frame_number: int) -> None:
+    def _refresh_track_head_bank(self, track: mot.TrackState, slot_or_vector, frame_number: int) -> None:
         if isinstance(slot_or_vector, V8TemplateMemorySlot):
             vector = self.F.normalize(slot_or_vector.vector.detach().clone(), dim=0)
             patch_tokens = slot_or_vector.patch_tokens.detach().clone() if slot_or_vector.patch_tokens is not None else None
@@ -3376,7 +3559,7 @@ class V8QualityBatchedLoRATTracker:
 
     def _should_refresh_head_memory(
         self,
-        track: v5.TrackState,
+        track: mot.TrackState,
         confidence: float,
         frame_number: int,
         candidate_source: str = "head",
@@ -3392,6 +3575,16 @@ class V8QualityBatchedLoRATTracker:
                 return False
         if track.path_score is not None and track.path_score < self.identity_arbitrator.min_path:
             return False
+        if track.initial_anchor_score is not None and track.initial_anchor_score < self.v8_memory_min_initial_anchor:
+            return False
+        if (
+            track.other_anchor_track_id is not None
+            and track.other_anchor_score is not None
+            and track.other_anchor_score >= 0.55
+            and track.identity_margin is not None
+            and track.identity_margin < self.v8_memory_min_identity_margin
+        ):
+            return False
         bank = self._get_track_head_bank(track)
         if len(bank) < self.lorat_memory_slots:
             return True
@@ -3399,12 +3592,12 @@ class V8QualityBatchedLoRATTracker:
         return frame_number - last_update >= self.lorat_memory_refresh_interval
 
     @staticmethod
-    def _commit_trusted_size(track: v5.TrackState, bbox: BBox) -> None:
-        track.trusted_size_bank.append(v5.clamp_bbox_size(bbox))
-        if len(track.trusted_size_bank) > v5.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE:
-            del track.trusted_size_bank[: len(track.trusted_size_bank) - v5.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE]
+    def _commit_trusted_size(track: mot.TrackState, bbox: BBox) -> None:
+        track.trusted_size_bank.append(mot.clamp_bbox_size(bbox))
+        if len(track.trusted_size_bank) > mot.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE:
+            del track.trusted_size_bank[: len(track.trusted_size_bank) - mot.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE]
 
-    def _refresh_feature_appearance(self, track: v5.TrackState, vector) -> None:
+    def _refresh_feature_appearance(self, track: mot.TrackState, vector) -> None:
         refresh_started = time.perf_counter()
         feature = self.F.normalize(vector.detach().to(self.device, dtype=self.torch.float32).clone(), dim=0)
         try:
@@ -3428,10 +3621,10 @@ class V8QualityBatchedLoRATTracker:
             self._add_profile_seconds("appearance_refresh", time.perf_counter() - refresh_started)
 
     @staticmethod
-    def _record_size_history(track: v5.TrackState, frame_number: int, bbox: BBox) -> None:
-        track.size_history.append((frame_number, v5.clamp_bbox_size(bbox)))
-        if len(track.size_history) > v5.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE:
-            del track.size_history[: len(track.size_history) - v5.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE]
+    def _record_size_history(track: mot.TrackState, frame_number: int, bbox: BBox) -> None:
+        track.size_history.append((frame_number, mot.clamp_bbox_size(bbox)))
+        if len(track.size_history) > mot.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE:
+            del track.size_history[: len(track.size_history) - mot.DEFAULT_LORAT_SIZE_MEMORY_BANK_SIZE]
 
     def _update_gpu_status(self) -> None:
         if self.device.type != "cuda":
@@ -3440,15 +3633,23 @@ class V8QualityBatchedLoRATTracker:
         reserved = self.torch.cuda.memory_reserved(self.device)
         peak_allocated = self.torch.cuda.max_memory_allocated(self.device)
         peak_reserved = self.torch.cuda.max_memory_reserved(self.device)
-        self.runtime_status.gpu_allocated_mb = v5.bytes_to_mb(allocated)
-        self.runtime_status.gpu_reserved_mb = v5.bytes_to_mb(reserved)
-        self.runtime_status.gpu_peak_allocated_mb = v5.bytes_to_mb(peak_allocated)
-        self.runtime_status.gpu_peak_reserved_mb = v5.bytes_to_mb(peak_reserved)
+        self.runtime_status.gpu_allocated_mb = mot.bytes_to_mb(allocated)
+        self.runtime_status.gpu_reserved_mb = mot.bytes_to_mb(reserved)
+        self.runtime_status.gpu_peak_allocated_mb = mot.bytes_to_mb(peak_allocated)
+        self.runtime_status.gpu_peak_reserved_mb = mot.bytes_to_mb(peak_reserved)
 
     def status_lines(self) -> List[str]:
         status = self.runtime_status_snapshot()
+        lifecycle_counts = mot.track_lifecycle_counts(self.tracks)
         lines = [
             f"FPS {status.fps:.2f} | objects {status.active_objects} | mode {V8_EXECUTION_MODE}",
+            (
+                "Track states "
+                f"healthy {lifecycle_counts.get(mot.TrackLifecycle.HEALTHY, 0)} | "
+                f"uncertain {lifecycle_counts.get(mot.TrackLifecycle.UNCERTAIN, 0)} | "
+                f"lost {lifecycle_counts.get(mot.TrackLifecycle.LOST, 0)} | "
+                f"reacquired {lifecycle_counts.get(mot.TrackLifecycle.REACQUIRED, 0)}"
+            ),
             (
                 "shared ViT/frame "
                 f"{status.shared_frame_backbone_calls} | head batches {status.object_head_batches} | "
@@ -3496,7 +3697,7 @@ class V8QualityBatchedLoRATTracker:
             lines.append(gpu)
         return lines
 
-    def runtime_status_snapshot(self) -> v5.RuntimeStatus:
+    def runtime_status_snapshot(self) -> mot.RuntimeStatus:
         status = copy.copy(self.runtime_status)
         status.gating_decisions = self.v8_gating_decisions
         status.gating_primary_decisions = self.v8_primary_decisions
@@ -3560,8 +3761,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-fps", type=float, default=30.0, help="Playback FPS for image sequence inputs.")
     parser.add_argument("--initial-boxes", help="Semicolon-separated x,y,w,h boxes for headless/non-interactive runs.")
     parser.add_argument("--device", default="cpu", help="LoRAT device: cpu, dml/directml, cuda:0.")
-    parser.add_argument("--lorat-root", type=Path, default=v5.DEFAULT_LORAT_ROOT, help="Local LoRAT checkout.")
-    parser.add_argument("--lorat-config", default="B-224", choices=tuple(v5.LORAT_WEIGHT_BY_CONFIG))
+    parser.add_argument("--lorat-root", type=Path, default=mot.DEFAULT_LORAT_ROOT, help="Local LoRAT checkout.")
+    parser.add_argument("--lorat-config", default="B-224", choices=tuple(mot.LORAT_WEIGHT_BY_CONFIG))
     parser.add_argument("--weight-path", type=Path, help="LoRAT weight. Defaults from --lorat-config.")
     parser.add_argument("--max-tracks", type=int, default=0, help="Optional track cap. 0 means no cap.")
     parser.add_argument("--disable-amp", action="store_true", help="Disable LoRAT automatic mixed precision.")
@@ -3574,7 +3775,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--v8-head-rank",
         type=int,
-        default=v5.DEFAULT_LORAT_MEMORY_SLOTS,
+        default=mot.DEFAULT_LORAT_MEMORY_SLOTS,
         help="Maximum per-object low-rank heads scored from the V8 head bank.",
     )
     parser.add_argument("--v8-head-hidden-dim", type=int, default=256, help="Hidden dimension for the trainable V8 LoRA object head.")
@@ -3605,45 +3806,45 @@ def parse_args() -> argparse.Namespace:
         default="max",
         help="How to reduce a per-object head bank to one response map.",
     )
-    parser.add_argument("--lorat-memory-slots", type=int, default=v5.DEFAULT_LORAT_MEMORY_SLOTS)
-    parser.add_argument("--lorat-memory-refresh-interval", type=int, default=v5.DEFAULT_LORAT_MEMORY_REFRESH_INTERVAL)
+    parser.add_argument("--lorat-memory-slots", type=int, default=mot.DEFAULT_LORAT_MEMORY_SLOTS)
+    parser.add_argument("--lorat-memory-refresh-interval", type=int, default=mot.DEFAULT_LORAT_MEMORY_REFRESH_INTERVAL)
     parser.add_argument("--lorat-memory-min-score", type=float, default=0.55)
-    parser.add_argument("--lorat-accept-min-score", type=float, default=v5.DEFAULT_LORAT_ACCEPT_MIN_SCORE)
+    parser.add_argument("--lorat-accept-min-score", type=float, default=mot.DEFAULT_LORAT_ACCEPT_MIN_SCORE)
     parser.add_argument(
         "--fixed-lorat-box-size",
         dest="lorat_fixed_box_size",
         action="store_true",
-        default=v5.DEFAULT_LORAT_FIXED_BOX_SIZE,
+        default=mot.DEFAULT_LORAT_FIXED_BOX_SIZE,
     )
     parser.add_argument("--allow-lorat-size-change", dest="lorat_fixed_box_size", action="store_false")
-    parser.add_argument("--lorat-min-box-area", type=float, default=v5.DEFAULT_LORAT_MIN_BOX_AREA)
-    parser.add_argument("--lorat-max-area-change-per-frame", type=float, default=v5.DEFAULT_LORAT_MAX_AREA_CHANGE_PER_FRAME)
-    parser.add_argument("--lorat-trusted-size-floor-scale", type=float, default=v5.DEFAULT_LORAT_TRUSTED_SIZE_FLOOR_SCALE)
-    parser.add_argument("--shrink-guard-window", type=int, default=v5.DEFAULT_SHRINK_GUARD_WINDOW)
-    parser.add_argument("--shrink-guard-area-ratio", type=float, default=v5.DEFAULT_SHRINK_GUARD_AREA_RATIO)
-    parser.add_argument("--shrink-guard-step-ratio", type=float, default=v5.DEFAULT_SHRINK_GUARD_STEP_RATIO)
-    parser.add_argument("--shrink-guard-min-confidence", type=float, default=v5.DEFAULT_SHRINK_GUARD_MIN_CONFIDENCE)
-    parser.add_argument("--shrink-guard-min-reid", type=float, default=v5.DEFAULT_SHRINK_GUARD_MIN_REID)
-    parser.add_argument("--crop-information-min-score", type=float, default=v5.DEFAULT_CROP_INFORMATION_MIN_SCORE)
-    parser.add_argument("--crop-information-min-pixels", type=int, default=v5.DEFAULT_CROP_INFORMATION_MIN_PIXELS)
+    parser.add_argument("--lorat-min-box-area", type=float, default=mot.DEFAULT_LORAT_MIN_BOX_AREA)
+    parser.add_argument("--lorat-max-area-change-per-frame", type=float, default=mot.DEFAULT_LORAT_MAX_AREA_CHANGE_PER_FRAME)
+    parser.add_argument("--lorat-trusted-size-floor-scale", type=float, default=mot.DEFAULT_LORAT_TRUSTED_SIZE_FLOOR_SCALE)
+    parser.add_argument("--shrink-guard-window", type=int, default=mot.DEFAULT_SHRINK_GUARD_WINDOW)
+    parser.add_argument("--shrink-guard-area-ratio", type=float, default=mot.DEFAULT_SHRINK_GUARD_AREA_RATIO)
+    parser.add_argument("--shrink-guard-step-ratio", type=float, default=mot.DEFAULT_SHRINK_GUARD_STEP_RATIO)
+    parser.add_argument("--shrink-guard-min-confidence", type=float, default=mot.DEFAULT_SHRINK_GUARD_MIN_CONFIDENCE)
+    parser.add_argument("--shrink-guard-min-reid", type=float, default=mot.DEFAULT_SHRINK_GUARD_MIN_REID)
+    parser.add_argument("--crop-information-min-score", type=float, default=mot.DEFAULT_CROP_INFORMATION_MIN_SCORE)
+    parser.add_argument("--crop-information-min-pixels", type=int, default=mot.DEFAULT_CROP_INFORMATION_MIN_PIXELS)
     parser.add_argument("--disable-identity-arbitration", action="store_true")
-    parser.add_argument("--identity-min-score", type=float, default=v5.DEFAULT_IDENTITY_MIN_SCORE)
-    parser.add_argument("--identity-min-reid", type=float, default=v5.DEFAULT_IDENTITY_MIN_REID)
-    parser.add_argument("--identity-min-motion", type=float, default=v5.DEFAULT_IDENTITY_MIN_MOTION)
-    parser.add_argument("--identity-min-path", type=float, default=v5.DEFAULT_IDENTITY_MIN_PATH)
+    parser.add_argument("--identity-min-score", type=float, default=mot.DEFAULT_IDENTITY_MIN_SCORE)
+    parser.add_argument("--identity-min-reid", type=float, default=mot.DEFAULT_IDENTITY_MIN_REID)
+    parser.add_argument("--identity-min-motion", type=float, default=mot.DEFAULT_IDENTITY_MIN_MOTION)
+    parser.add_argument("--identity-min-path", type=float, default=mot.DEFAULT_IDENTITY_MIN_PATH)
     parser.add_argument("--identity-bank-size", type=int, default=12)
-    parser.add_argument("--identity-memory-min-confidence", type=float, default=v5.DEFAULT_IDENTITY_MEMORY_MIN_CONFIDENCE)
-    parser.add_argument("--occlusion-max-frames", type=int, default=v5.DEFAULT_OCCLUSION_MAX_FRAMES)
-    parser.add_argument("--occlusion-iou-threshold", type=float, default=v5.DEFAULT_OCCLUSION_IOU_THRESHOLD)
-    parser.add_argument("--occlusion-velocity-damping", type=float, default=v5.DEFAULT_OCCLUSION_VELOCITY_DAMPING)
-    parser.add_argument("--reid-recovery-min-score", type=float, default=v5.DEFAULT_REID_RECOVERY_MIN_SCORE)
-    parser.add_argument("--reid-recovery-min-reid", type=float, default=v5.DEFAULT_REID_RECOVERY_MIN_REID)
-    parser.add_argument("--reid-recovery-min-motion", type=float, default=v5.DEFAULT_REID_RECOVERY_MIN_MOTION)
-    parser.add_argument("--reid-recovery-min-confidence", type=float, default=v5.DEFAULT_REID_RECOVERY_MIN_CONFIDENCE)
-    parser.add_argument("--view-change-min-score", type=float, default=v5.DEFAULT_VIEW_CHANGE_MIN_SCORE)
-    parser.add_argument("--view-change-min-motion", type=float, default=v5.DEFAULT_VIEW_CHANGE_MIN_MOTION)
-    parser.add_argument("--view-change-min-confidence", type=float, default=v5.DEFAULT_VIEW_CHANGE_MIN_CONFIDENCE)
-    parser.add_argument("--view-change-max-lost-frames", type=int, default=v5.DEFAULT_VIEW_CHANGE_MAX_LOST_FRAMES)
+    parser.add_argument("--identity-memory-min-confidence", type=float, default=mot.DEFAULT_IDENTITY_MEMORY_MIN_CONFIDENCE)
+    parser.add_argument("--occlusion-max-frames", type=int, default=mot.DEFAULT_OCCLUSION_MAX_FRAMES)
+    parser.add_argument("--occlusion-iou-threshold", type=float, default=mot.DEFAULT_OCCLUSION_IOU_THRESHOLD)
+    parser.add_argument("--occlusion-velocity-damping", type=float, default=mot.DEFAULT_OCCLUSION_VELOCITY_DAMPING)
+    parser.add_argument("--reid-recovery-min-score", type=float, default=mot.DEFAULT_REID_RECOVERY_MIN_SCORE)
+    parser.add_argument("--reid-recovery-min-reid", type=float, default=mot.DEFAULT_REID_RECOVERY_MIN_REID)
+    parser.add_argument("--reid-recovery-min-motion", type=float, default=mot.DEFAULT_REID_RECOVERY_MIN_MOTION)
+    parser.add_argument("--reid-recovery-min-confidence", type=float, default=mot.DEFAULT_REID_RECOVERY_MIN_CONFIDENCE)
+    parser.add_argument("--view-change-min-score", type=float, default=mot.DEFAULT_VIEW_CHANGE_MIN_SCORE)
+    parser.add_argument("--view-change-min-motion", type=float, default=mot.DEFAULT_VIEW_CHANGE_MIN_MOTION)
+    parser.add_argument("--view-change-min-confidence", type=float, default=mot.DEFAULT_VIEW_CHANGE_MIN_CONFIDENCE)
+    parser.add_argument("--view-change-max-lost-frames", type=int, default=mot.DEFAULT_VIEW_CHANGE_MAX_LOST_FRAMES)
     parser.add_argument("--v8-primary-heads-per-track", type=int, default=DEFAULT_V8_PRIMARY_HEADS_PER_TRACK)
     parser.add_argument("--v8-recovery-heads-per-track", type=int, default=DEFAULT_V8_RECOVERY_HEADS_PER_TRACK)
     parser.add_argument("--v8-recovery-interval", type=int, default=DEFAULT_V8_RECOVERY_INTERVAL)
@@ -3695,6 +3896,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v8-memory-min-path", type=float, default=DEFAULT_V8_MEMORY_MIN_PATH)
     parser.add_argument("--v8-memory-min-appearance", type=float, default=DEFAULT_V8_MEMORY_MIN_APPEARANCE)
     parser.add_argument("--v8-memory-min-stable-updates", type=int, default=DEFAULT_V8_MEMORY_MIN_STABLE_UPDATES)
+    parser.add_argument(
+        "--v8-accept-min-initial-anchor",
+        type=float,
+        default=DEFAULT_V8_ACCEPT_MIN_INITIAL_ANCHOR,
+        help="Minimum first-template appearance anchor for accepting low-appearance V8 candidates.",
+    )
+    parser.add_argument(
+        "--v8-accept-min-identity-margin",
+        type=float,
+        default=DEFAULT_V8_ACCEPT_MIN_IDENTITY_MARGIN,
+        help="Minimum initial-anchor margin over other tracks before accepting ambiguous V8 candidates.",
+    )
+    parser.add_argument(
+        "--v8-memory-min-initial-anchor",
+        type=float,
+        default=DEFAULT_V8_MEMORY_MIN_INITIAL_ANCHOR,
+        help="Minimum first-template appearance anchor before a V8 candidate can refresh learned memory.",
+    )
+    parser.add_argument(
+        "--v8-memory-min-identity-margin",
+        type=float,
+        default=DEFAULT_V8_MEMORY_MIN_IDENTITY_MARGIN,
+        help="Minimum first-template margin over other tracks before refreshing learned memory.",
+    )
     parser.add_argument("--v8-window-penalty-ratio", type=float, default=DEFAULT_V8_WINDOW_PENALTY_RATIO)
     parser.add_argument("--output", type=Path, help="MOTChallenge-format result file.")
     parser.add_argument("--save-video", type=Path, help="Annotated MP4 output path.")
@@ -3704,6 +3929,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-slot-debug-log", action="store_true", help="Compatibility no-op; slot debug is disabled unless --slot-debug-log is set.")
     parser.add_argument("--week2-proof-log", type=Path, help="Enable and write Week 2 shared-backbone proof CSV output to this path.")
     parser.add_argument("--no-week2-proof-log", action="store_true", help="Compatibility no-op; proof logging is disabled unless --week2-proof-log is set or a benchmark enables it.")
+    parser.add_argument("--manual-event-log", type=Path, help="Human-cost event CSV for manual reanchors.")
+    parser.add_argument("--no-manual-event-log", action="store_true", help="Disable manual reanchor event CSV writing.")
     parser.add_argument("--debug-frame-start", type=int, default=0, help="First frame to include in --debug-log; 0 means all.")
     parser.add_argument("--debug-frame-end", type=int, default=0, help="Last frame to include in --debug-log; 0 means all.")
     parser.add_argument("--max-frames", type=int, default=0, help="Optional frame limit for smoke tests.")
@@ -3711,8 +3938,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def create_backend(args: argparse.Namespace, source: v5.FrameSource, expected_tracks: int = 0):
-    weight_path = args.weight_path or v5.LORAT_WEIGHT_BY_CONFIG[args.lorat_config]
+def create_backend(args: argparse.Namespace, source: mot.FrameSource, expected_tracks: int = 0):
+    weight_path = args.weight_path or mot.LORAT_WEIGHT_BY_CONFIG[args.lorat_config]
     return V8QualityBatchedLoRATTracker(
         args.lorat_root,
         args.lorat_config,
@@ -3786,21 +4013,30 @@ def create_backend(args: argparse.Namespace, source: v5.FrameSource, expected_tr
         args.v8_memory_min_path,
         args.v8_memory_min_appearance,
         args.v8_memory_min_stable_updates,
+        args.v8_accept_min_initial_anchor,
+        args.v8_accept_min_identity_margin,
+        args.v8_memory_min_initial_anchor,
+        args.v8_memory_min_identity_margin,
         args.v8_window_penalty_ratio,
     )
 
 
 def default_output_path(source_name: str) -> Path:
-    return v5.default_output_path(source_name, "lorat_v8")
+    return mot.default_output_path(source_name, "lorat_v8")
 
 
 def default_debug_log_path(source_name: str) -> Path:
-    return v5.default_debug_log_path(source_name, "lorat_v8")
+    return mot.default_debug_log_path(source_name, "lorat_v8")
 
 
 def default_week2_proof_log_path(source_name: str) -> Path:
     safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in source_name)
-    return v5.DEFAULT_DEBUG_DIR / f"{safe_name}_lorat_v8_week2_proof.csv"
+    return mot.DEFAULT_DEBUG_DIR / f"{safe_name}_lorat_v8_week2_proof.csv"
+
+
+def default_manual_event_log_path(source_name: str) -> Path:
+    safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in source_name)
+    return mot.DEFAULT_DEBUG_DIR / f"{safe_name}_lorat_v8_manual_events.csv"
 
 
 def write_week2_proof_log(path: Path, lines: Sequence[str]) -> None:
@@ -3811,7 +4047,7 @@ def write_week2_proof_log(path: Path, lines: Sequence[str]) -> None:
 def append_v8_debug_rows(
     lines: List[str],
     frame_number: int,
-    tracks: Sequence[v5.TrackState],
+    tracks: Sequence[mot.TrackState],
     start_frame: int = 0,
     end_frame: int = 0,
 ) -> None:
@@ -3825,37 +4061,38 @@ def append_v8_debug_rows(
             str(frame_number),
             str(track.track_id),
             "1" if track.ok else "0",
-            v5.csv_text(track.state),
-            v5.csv_float(track.confidence),
-            v5.csv_float(track.raw_confidence),
-            v5.csv_float(track.confidence_baseline),
-            *v5.csv_bbox(track.bbox),
-            *v5.csv_bbox_measurements(track.bbox),
-            *v5.csv_bbox(track.raw_bbox),
-            *v5.csv_bbox(track.predicted_bbox),
-            *v5.csv_bbox(track.previous_bbox),
-            *v5.csv_bbox(track.velocity),
-            v5.csv_float(track.assignment_score),
-            v5.csv_float(track.assignment_margin),
-            v5.csv_float(track.reid_score),
-            v5.csv_float(track.motion_score),
-            v5.csv_float(track.path_score),
-            v5.csv_float(track.source_score),
-            v5.csv_float(track.initial_anchor_score),
-            v5.csv_float(track.other_anchor_score),
+            mot.csv_text(track.state),
+            mot.csv_float(track.confidence),
+            mot.csv_float(track.raw_confidence),
+            mot.csv_float(track.confidence_baseline),
+            *mot.csv_bbox(track.bbox),
+            *mot.csv_bbox_measurements(track.bbox),
+            *mot.csv_bbox(track.raw_bbox),
+            *mot.csv_bbox(track.predicted_bbox),
+            *mot.csv_bbox(track.previous_bbox),
+            *mot.csv_bbox(track.velocity),
+            mot.csv_float(track.assignment_score),
+            mot.csv_float(track.assignment_margin),
+            mot.csv_float(track.reid_score),
+            mot.csv_float(track.motion_score),
+            mot.csv_float(track.path_score),
+            mot.csv_float(track.source_score),
+            mot.csv_float(track.initial_anchor_score),
+            mot.csv_float(track.other_anchor_score),
             str(track.other_anchor_track_id) if track.other_anchor_track_id is not None else "",
-            v5.csv_float(track.identity_margin),
+            mot.csv_float(track.identity_margin),
             str(track.occlusion_track_id) if track.occlusion_track_id is not None else "",
-            v5.csv_float(track.occlusion_iou),
-            v5.csv_text(track.assigned_source),
+            mot.csv_float(track.occlusion_iou),
+            mot.csv_text(track.assigned_source),
             str(track.lost_frames),
             str(track.occluded_frames),
             str(track.last_reliable_frame) if track.last_reliable_frame else "",
             str(track.active_template_frame) if track.active_template_frame is not None else "",
-            v5.csv_text(track.active_lorat_slot),
+            mot.csv_text(track.active_lorat_slot),
             str(track.lorat_memory_slot_count),
             str(len(track.appearance_bank)),
             str(len(getattr(track, "v8_feature_bank", []))),
+            mot.csv_text(mot.set_track_lifecycle(track)),
         ]
         lines.append(",".join(fields) + "\n")
 
@@ -3866,16 +4103,17 @@ def write_v8_debug_log(path: Path, lines: Sequence[str]) -> None:
 
 
 def default_video_path(source_name: str) -> Path:
-    return v5.default_video_path(source_name, "lorat_v8")
+    return mot.default_video_path(source_name, "lorat_v8")
 
 
 def main() -> int:
     args = parse_args()
-    frame_source = v5.open_frame_source(args)
+    frame_source = mot.open_frame_source(args)
     output_path = args.output or default_output_path(frame_source.name)
     debug_log_path = args.debug_log or default_debug_log_path(frame_source.name)
     slot_debug_log_path = None if args.no_slot_debug_log else args.slot_debug_log
     week2_proof_log_path = None if args.no_week2_proof_log else args.week2_proof_log
+    manual_event_log_path = None if args.no_manual_event_log else (args.manual_event_log or default_manual_event_log_path(frame_source.name))
     save_video_path = None if args.no_save_video else (args.save_video or default_video_path(frame_source.name))
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3888,7 +4126,7 @@ def main() -> int:
     if not boxes and args.no_display:
         raise RuntimeError("--no-display requires --initial-boxes.")
     if not boxes:
-        boxes = v5.select_boxes(first_frame)
+        boxes = mot.select_boxes(first_frame)
     if not boxes:
         print("No bounding boxes selected. Exiting.")
         frame_source.release()
@@ -3896,9 +4134,10 @@ def main() -> int:
         return 0
 
     backend = create_backend(args, frame_source, len(boxes))
-    writer = v5.make_video_writer(save_video_path, frame_source.fps, first_frame) if save_video_path is not None else None
+    writer = mot.make_video_writer(save_video_path, frame_source.fps, first_frame) if save_video_path is not None else None
     mot_lines: List[str] = []
     debug_lines: List[str] = []
+    manual_events: List[mot.ManualReanchorEvent] = []
     frame_number = 1
     paused = False
     outputs_written = False
@@ -3913,19 +4152,22 @@ def main() -> int:
         write_v8_debug_log(debug_log_path, debug_lines)
         print(f"Wrote debug CSV to: {debug_log_path}")
         if slot_debug_log_path is not None:
-            v5.write_slot_debug_log(slot_debug_log_path, backend.slot_debug_lines)
+            mot.write_slot_debug_log(slot_debug_log_path, backend.slot_debug_lines)
             print(f"Wrote V8 head-bank debug CSV to: {slot_debug_log_path}")
         if week2_proof_log_path is not None:
             write_week2_proof_log(week2_proof_log_path, backend.week2_proof_lines)
             print(f"Wrote Week 2 shared-backbone proof CSV to: {week2_proof_log_path}")
+        if manual_event_log_path is not None:
+            mot.write_manual_event_csv(manual_event_log_path, manual_events)
+            print(f"Wrote manual event CSV to: {manual_event_log_path}")
         outputs_written = True
 
     try:
         backend.initialize(first_frame, boxes, frame_number)
-        v5.append_mot_results(mot_lines, frame_number, backend.tracks)
+        mot.append_mot_results(mot_lines, frame_number, backend.tracks)
         append_v8_debug_rows(debug_lines, frame_number, backend.tracks, args.debug_frame_start, args.debug_frame_end)
         if writer is not None:
-            writer.write(v5.draw_tracks(first_frame, backend.tracks, frame_number, backend.backend_name, backend.status_lines()))
+            writer.write(mot.draw_tracks(first_frame, backend.tracks, frame_number, backend.backend_name, backend.status_lines()))
 
         while True:
             if not paused:
@@ -3935,12 +4177,12 @@ def main() -> int:
                 last_frame = frame
                 frame_number += 1
                 backend.update(frame, frame_number)
-                v5.append_mot_results(mot_lines, frame_number, backend.tracks)
+                mot.append_mot_results(mot_lines, frame_number, backend.tracks)
                 append_v8_debug_rows(debug_lines, frame_number, backend.tracks, args.debug_frame_start, args.debug_frame_end)
             else:
                 frame = last_frame.copy()
 
-            shown = v5.draw_tracks(frame, backend.tracks, frame_number, backend.backend_name, backend.status_lines())
+            shown = mot.draw_tracks(frame, backend.tracks, frame_number, backend.backend_name, backend.status_lines())
             if writer is not None and not paused:
                 writer.write(shown)
 
@@ -3953,10 +4195,10 @@ def main() -> int:
                     paused = not paused
                 if key == ord("a"):
                     paused = True
-                    new_boxes = v5.select_boxes(frame, "Add Objects")
+                    new_boxes = mot.select_boxes(frame, "Add Objects")
                     if new_boxes:
                         added_tracks = backend.add_tracks(frame, new_boxes, frame_number)
-                        v5.append_mot_results(mot_lines, frame_number, added_tracks)
+                        mot.append_mot_results(mot_lines, frame_number, added_tracks)
                         append_v8_debug_rows(
                             debug_lines,
                             frame_number,
@@ -3964,6 +4206,41 @@ def main() -> int:
                             args.debug_frame_start,
                             args.debug_frame_end,
                         )
+                    paused = False
+                if key == ord("r"):
+                    paused = True
+                    target_track = mot.choose_manual_reanchor_track(backend.tracks)
+                    if target_track is None:
+                        print("No track available for manual reanchor.")
+                    else:
+                        started = time.perf_counter()
+                        title = f"Re-anchor Track {target_track.track_id}"
+                        reanchor_boxes = mot.select_boxes(frame, title)
+                        seconds_spent = time.perf_counter() - started
+                        if reanchor_boxes:
+                            event = backend.manual_reanchor_track(
+                                target_track.track_id,
+                                frame,
+                                reanchor_boxes[0],
+                                frame_number,
+                                seconds_spent=seconds_spent,
+                                source="keyboard_r",
+                            )
+                            manual_events.append(event)
+                            mot.append_mot_results(mot_lines, frame_number, [target_track])
+                            append_v8_debug_rows(
+                                debug_lines,
+                                frame_number,
+                                backend.tracks,
+                                args.debug_frame_start,
+                                args.debug_frame_end,
+                            )
+                            if manual_event_log_path is not None:
+                                mot.write_manual_event_csv(manual_event_log_path, manual_events)
+                            print(
+                                f"Manual reanchor track {target_track.track_id} at frame {frame_number} "
+                                f"({seconds_spent:.2f}s)."
+                            )
                     paused = False
 
             if args.max_frames > 0 and frame_number >= args.max_frames:

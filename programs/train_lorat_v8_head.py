@@ -1,3 +1,16 @@
+"""Train the V8 shared-frame LoRAT head.
+
+The trainer is intentionally staged:
+
+1. Preserve LoRAT's target-conditioned SOT behavior with template/search-style
+   samples and LoRAT-style score-map plus box losses.
+2. Teach the V8 head to run on one frozen shared LoRAT/DINOv2 frame feature map.
+3. Add selected-target-vs-distractor ranking so selected parts, such as a head
+   or face crop, do not drift toward the whole annotated object.
+4. Keep ReID/missing-target probes in the same training file so Week 3 recovery
+   behavior is trained and measured against the same head.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -13,6 +26,7 @@ import numpy as np
 
 import bounding_box_v8_lorat_quality_batched as v8
 import exercise_lorat_mot as exercise
+import mot_common as mot
 
 BBox = Tuple[float, float, float, float]
 
@@ -37,6 +51,7 @@ class V8TrainingObject:
     search_bbox: BBox
     target_kind: str = "full"
     is_present: bool = True
+    distractor_bboxes: Tuple[BBox, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -54,6 +69,18 @@ class V8TrainingTargetStats:
     positive_cells_outside_search: int
     hard_negative_cells: int
     missing_targets: int
+    present_targets: int = 0
+    target_center_outside_search: int = 0
+    mean_target_search_coverage: float = 1.0
+    min_target_search_coverage: float = 1.0
+    mean_search_target_area_ratio: float = 0.0
+
+
+@dataclass(frozen=True)
+class V8CandidateDiscriminationStats:
+    objects: int = 0
+    positive_candidates: int = 0
+    negative_candidates: int = 0
 
 
 @dataclass(frozen=True)
@@ -204,9 +231,15 @@ def stable_region_order(specs: Sequence[V8SelectedRegionSpec], track_id: int, fr
         return specs
     offset = abs((int(track_id) * 1315423911) ^ int(frame_number)) % len(specs)
     rotated = specs[offset:] + specs[:offset]
-    if FULL_REGION_SPEC in specs:
-        return [FULL_REGION_SPEC, *[spec for spec in rotated if spec.name != "full"]]
-    return rotated
+    priority_names = ("full", "head_like_top")
+    prioritized: List[V8SelectedRegionSpec] = []
+    for name in priority_names:
+        for spec in specs:
+            if spec.name == name and spec not in prioritized:
+                prioritized.append(spec)
+                break
+    prioritized_names = {spec.name for spec in prioritized}
+    return [*prioritized, *[spec for spec in rotated if spec.name not in prioritized_names]]
 
 
 def make_lorat_augmentation_spec(rng: np.random.Generator, enabled: bool) -> LoRATTrainingAugmentationSpec:
@@ -289,9 +322,81 @@ def apply_search_bbox_augmentation(objects: Sequence[V8TrainingObject], frame_wi
             current_bbox=flip_bbox_horizontal(item.current_bbox, frame_width),
             previous_bbox=flip_bbox_horizontal(item.previous_bbox, frame_width),
             search_bbox=flip_bbox_horizontal(item.search_bbox, frame_width),
+            distractor_bboxes=tuple(flip_bbox_horizontal(bbox, frame_width) for bbox in item.distractor_bboxes),
         )
         for item in objects
     ]
+
+
+def attach_distractor_bboxes(objects: Sequence[V8TrainingObject]) -> List[V8TrainingObject]:
+    present = [item for item in objects if item.is_present]
+    updated: List[V8TrainingObject] = []
+    for item in objects:
+        distractors = tuple(
+            other.current_bbox
+            for other in present
+            if other.track_id != item.track_id
+        )
+        updated.append(replace(item, distractor_bboxes=distractors))
+    return updated
+
+
+def translate_bbox(bbox: BBox, origin_x: float, origin_y: float) -> BBox:
+    x, y, w, h = bbox
+    return float(x - origin_x), float(y - origin_y), float(w), float(h)
+
+
+def crop_frame_with_padding(frame: np.ndarray, crop_bbox: BBox) -> Tuple[np.ndarray, float, float]:
+    frame_height, frame_width = frame.shape[:2]
+    x, y, w, h = crop_bbox
+    left = int(np.floor(float(x)))
+    top = int(np.floor(float(y)))
+    right = int(np.ceil(float(x + max(1.0, w))))
+    bottom = int(np.ceil(float(y + max(1.0, h))))
+    crop_width = max(1, right - left)
+    crop_height = max(1, bottom - top)
+    crop = np.zeros((crop_height, crop_width, frame.shape[2]), dtype=frame.dtype)
+
+    src_left = max(0, left)
+    src_top = max(0, top)
+    src_right = min(frame_width, right)
+    src_bottom = min(frame_height, bottom)
+    if src_right > src_left and src_bottom > src_top:
+        dst_left = src_left - left
+        dst_top = src_top - top
+        crop[dst_top:dst_top + (src_bottom - src_top), dst_left:dst_left + (src_right - src_left)] = frame[src_top:src_bottom, src_left:src_right]
+    return np.ascontiguousarray(crop), float(left), float(top)
+
+
+def crop_training_batches(frame: np.ndarray, objects: Sequence[V8TrainingObject], mode: str) -> List[Tuple[np.ndarray, List[V8TrainingObject], str]]:
+    mode = str(mode or "full").strip().lower()
+    if mode == "full":
+        return [(frame, list(objects), "full")]
+    if mode != "search_crop":
+        raise ValueError(f"Unknown training frame mode: {mode!r}")
+
+    batches: List[Tuple[np.ndarray, List[V8TrainingObject], str]] = []
+    for item in objects:
+        crop, origin_x, origin_y = crop_frame_with_padding(frame, expanded_training_search_bbox(item, 1.0))
+        crop_h, crop_w = crop.shape[:2]
+        transformed = replace(
+            item,
+            current_bbox=translate_bbox(item.current_bbox, origin_x, origin_y),
+            previous_bbox=translate_bbox(item.previous_bbox, origin_x, origin_y),
+            search_bbox=(0.0, 0.0, float(crop_w), float(crop_h)),
+            distractor_bboxes=tuple(translate_bbox(bbox, origin_x, origin_y) for bbox in item.distractor_bboxes),
+        )
+        batches.append((crop, [transformed], "search_crop"))
+    return batches
+
+
+def effective_training_frame_mode(mode: str, epoch: int, crop_stage_epochs: int) -> str:
+    mode = str(mode or "full").strip().lower()
+    if mode == "staged":
+        return "search_crop" if int(epoch) <= max(0, int(crop_stage_epochs)) else "full"
+    if mode in {"full", "search_crop"}:
+        return mode
+    raise ValueError(f"Unknown training frame mode: {mode!r}")
 
 
 def update_recent_track_history(
@@ -342,6 +447,11 @@ class MOTFrameHeadDataset:
         lost_target_probability: float,
         max_lost_targets_per_frame: int,
         max_missing_gap_frames: int,
+        search_anchor_mode: str = "current",
+        repair_search_to_target: bool = True,
+        search_target_padding_fraction: float = 0.05,
+        sequence_name_filter: Optional[str] = None,
+        track_id_filter: Optional[int] = None,
     ) -> None:
         self.dataset_root = dataset_root
         self.split = split
@@ -364,6 +474,13 @@ class MOTFrameHeadDataset:
         self.lost_target_probability = max(0.0, min(1.0, float(lost_target_probability)))
         self.max_lost_targets_per_frame = max(0, int(max_lost_targets_per_frame))
         self.max_missing_gap_frames = max(1, int(max_missing_gap_frames))
+        self.search_anchor_mode = str(search_anchor_mode or "current").strip().lower()
+        if self.search_anchor_mode not in {"current", "previous", "union"}:
+            raise ValueError(f"Unknown search_anchor_mode: {search_anchor_mode!r}")
+        self.repair_search_to_target = bool(repair_search_to_target)
+        self.search_target_padding_fraction = max(0.0, float(search_target_padding_fraction))
+        self.sequence_name_filter = str(sequence_name_filter).strip() if sequence_name_filter else None
+        self.track_id_filter = int(track_id_filter) if track_id_filter is not None else None
         self.samples: List[V8TrainingSample] = []
         self._build(max_sequences=max_sequences, max_samples=max_samples)
 
@@ -373,6 +490,7 @@ class MOTFrameHeadDataset:
             for row in rows
             if row.confidence != 0
             and row.visibility >= self.min_visibility
+            and (self.track_id_filter is None or row.track_id == self.track_id_filter)
             and (self.class_ids is None or row.class_id in self.class_ids)
             and row.bbox[2] > 1
             and row.bbox[3] > 1
@@ -384,6 +502,8 @@ class MOTFrameHeadDataset:
         if max_sequences > 0:
             sequences = sequences[:max_sequences]
         for sequence_path in sequences:
+            if self.sequence_name_filter and sequence_path.name != self.sequence_name_filter:
+                continue
             image_paths = exercise.get_image_paths(sequence_path)
             gt_by_frame = exercise.read_gt(sequence_path)
             if not image_paths or not gt_by_frame:
@@ -419,9 +539,11 @@ class MOTFrameHeadDataset:
                             template_row = recent_history[int(rng.integers(0, len(recent_history)))]
                         elif self.template_sampling == "mixed":
                             draw = float(rng.random())
-                            if draw < 0.40:
+                            if draw < 0.50:
+                                template_row = first_template_row
+                            elif draw < 0.75:
                                 template_row = previous_row
-                            elif draw < 0.70 and recent_history:
+                            elif recent_history:
                                 template_row = recent_history[int(rng.integers(0, len(recent_history)))]
                         template_index = exercise.frame_to_image_index(template_row.frame)
                         if template_index >= len(image_paths):
@@ -430,6 +552,27 @@ class MOTFrameHeadDataset:
                         previous_bbox = selected_region_bbox(previous_row.bbox, spec)
                         template_bbox = selected_region_bbox(template_row.bbox, spec)
                         noisy_previous_bbox = jitter_reference_bbox(previous_bbox, rng, self.previous_box_jitter)
+                        if self.search_anchor_mode == "previous":
+                            search_anchor_bbox = noisy_previous_bbox
+                        elif self.search_anchor_mode == "union":
+                            search_anchor_bbox = union_bbox_xywh(noisy_previous_bbox, current_bbox)
+                        else:
+                            search_anchor_bbox = current_bbox
+                        search_bbox = siamfc_search_bbox(
+                            search_anchor_bbox,
+                            (224, 224),
+                            self.search_area_factor,
+                            self.search_scale_jitter,
+                            self.search_translation_jitter,
+                            self.search_min_object_size,
+                            rng,
+                        )
+                        if self.repair_search_to_target:
+                            search_bbox = repair_search_bbox_to_cover_target(
+                                search_bbox,
+                                current_bbox,
+                                self.search_target_padding_fraction,
+                            )
                         objects.append(
                             V8TrainingObject(
                                 track_id=row.track_id,
@@ -438,15 +581,7 @@ class MOTFrameHeadDataset:
                                 template_frame=template_row.frame,
                                 template_bbox=template_bbox,
                                 template_context_bbox=siamfc_context_bbox(template_bbox, self.template_area_factor),
-                                search_bbox=siamfc_search_bbox(
-                                    noisy_previous_bbox,
-                                    (224, 224),
-                                    self.search_area_factor,
-                                    self.search_scale_jitter,
-                                    self.search_translation_jitter,
-                                    self.search_min_object_size,
-                                    rng,
-                                ),
+                                search_bbox=search_bbox,
                                 target_kind=spec.name,
                                 is_present=True,
                             )
@@ -479,7 +614,13 @@ class MOTFrameHeadDataset:
                             template_row = previous_row
                             if self.template_sampling == "first":
                                 template_row = first_template_row
-                            elif self.template_sampling in {"mixed", "window"} and recent_history:
+                            elif self.template_sampling == "mixed":
+                                draw = float(rng.random())
+                                if draw < 0.50:
+                                    template_row = first_template_row
+                                elif recent_history:
+                                    template_row = recent_history[int(rng.integers(0, len(recent_history)))]
+                            elif self.template_sampling == "window" and recent_history:
                                 template_row = recent_history[int(rng.integers(0, len(recent_history)))]
                             previous_bbox = selected_region_bbox(previous_row.bbox, spec)
                             template_bbox = selected_region_bbox(template_row.bbox, spec)
@@ -509,6 +650,7 @@ class MOTFrameHeadDataset:
                             break
 
                 if objects:
+                    objects = attach_distractor_bboxes(objects)
                     self.samples.append(
                         V8TrainingSample(
                             sequence_path=sequence_path,
@@ -534,11 +676,39 @@ def parse_class_ids(values: Optional[Sequence[int]]) -> Optional[List[int]]:
     return list(dict.fromkeys(int(value) for value in values))
 
 
+_FRAME_READ_WARNING_LIMIT = 100
+_frame_read_warning_count = 0
+
+
 def load_frame(path: Path) -> np.ndarray:
     frame = cv2.imread(str(path))
+    if frame is None and path.exists():
+        try:
+            raw_bytes = np.fromfile(str(path), dtype=np.uint8)
+            if raw_bytes.size:
+                frame = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+        except OSError:
+            frame = None
     if frame is None:
         raise RuntimeError(f"Unable to read frame: {path}")
     return frame
+
+
+def try_load_frame(path: Path, context: str) -> Optional[np.ndarray]:
+    global _frame_read_warning_count
+    try:
+        return load_frame(path)
+    except RuntimeError as error:
+        _frame_read_warning_count += 1
+        if _frame_read_warning_count <= _FRAME_READ_WARNING_LIMIT:
+            print(f"WARNING: skipping unreadable frame during {context}: {error}", file=sys.stderr, flush=True)
+        elif _frame_read_warning_count == _FRAME_READ_WARNING_LIMIT + 1:
+            print(
+                "WARNING: additional unreadable-frame messages suppressed; training will continue skipping bad samples.",
+                file=sys.stderr,
+                flush=True,
+            )
+        return None
 
 
 def bbox_center(bbox: BBox) -> Tuple[float, float]:
@@ -556,6 +726,62 @@ def gaussian_heatmap(torch_module, grid_height: int, grid_width: int, center_y: 
 def xywh_to_xyxy_tuple(bbox: BBox) -> Tuple[float, float, float, float]:
     x, y, w, h = bbox
     return x, y, x + w, y + h
+
+
+def bbox_area_xywh(bbox: BBox) -> float:
+    return max(0.0, float(bbox[2])) * max(0.0, float(bbox[3]))
+
+
+def bbox_intersection_area_xywh(left: BBox, right: BBox) -> float:
+    lx1, ly1, lx2, ly2 = xywh_to_xyxy_tuple(left)
+    rx1, ry1, rx2, ry2 = xywh_to_xyxy_tuple(right)
+    ix1 = max(float(lx1), float(rx1))
+    iy1 = max(float(ly1), float(ry1))
+    ix2 = min(float(lx2), float(rx2))
+    iy2 = min(float(ly2), float(ry2))
+    return max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+
+
+def bbox_coverage_xywh(inner: BBox, outer: BBox) -> float:
+    return bbox_intersection_area_xywh(inner, outer) / max(1.0, bbox_area_xywh(inner))
+
+
+def bbox_contains_center_xywh(outer: BBox, inner: BBox) -> bool:
+    x, y, w, h = outer
+    cx, cy = bbox_center(inner)
+    return float(x) <= cx <= float(x + w) and float(y) <= cy <= float(y + h)
+
+
+def bbox_center_inside_frame(bbox: BBox, frame_shape: Tuple[int, ...]) -> bool:
+    frame_height, frame_width = frame_shape[:2]
+    center_x, center_y = bbox_center(bbox)
+    return 0.0 <= float(center_x) < float(frame_width) and 0.0 <= float(center_y) < float(frame_height)
+
+
+def union_bbox_xywh(left: BBox, right: BBox, padding_fraction: float = 0.0) -> BBox:
+    lx1, ly1, lx2, ly2 = xywh_to_xyxy_tuple(left)
+    rx1, ry1, rx2, ry2 = xywh_to_xyxy_tuple(right)
+    x1 = min(float(lx1), float(rx1))
+    y1 = min(float(ly1), float(ry1))
+    x2 = max(float(lx2), float(rx2))
+    y2 = max(float(ly2), float(ry2))
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+    pad = max(0.0, float(padding_fraction))
+    if pad > 0.0:
+        pad_x = width * pad
+        pad_y = height * pad
+        x1 -= pad_x
+        y1 -= pad_y
+        width += pad_x * 2.0
+        height += pad_y * 2.0
+    return float(x1), float(y1), max(1.0, float(width)), max(1.0, float(height))
+
+
+def repair_search_bbox_to_cover_target(search_bbox: BBox, target_bbox: BBox, padding_fraction: float) -> BBox:
+    if bbox_coverage_xywh(target_bbox, search_bbox) >= 0.999 and bbox_contains_center_xywh(search_bbox, target_bbox):
+        return search_bbox
+    return union_bbox_xywh(search_bbox, target_bbox, padding_fraction)
 
 
 def bbox_to_grid_slice(
@@ -671,6 +897,11 @@ def make_lorat_style_targets(
     ref_y = ref_y[None, :, None].expand(object_count, grid_height, grid_width)
     ref_x = ref_x[None, None, :].expand(object_count, grid_height, grid_width)
     frame_height, frame_width = frame_shape[:2]
+    present_targets = 0
+    target_center_outside_search = 0
+    coverage_sum = 0.0
+    min_coverage = 1.0
+    area_ratio_sum = 0.0
 
     for index, item in enumerate(objects):
         if not item.is_present:
@@ -682,8 +913,16 @@ def make_lorat_style_targets(
             )
             loss_mask[index, search_y, search_x] = True
             continue
+        present_targets += 1
         pos_y, pos_x = bbox_to_grid_slice(item.current_bbox, frame_shape, grid_height, grid_width)
         positive_mask[index, pos_y, pos_x] = True
+        item_search_bbox = expanded_training_search_bbox(item, search_radius_factor)
+        coverage = bbox_coverage_xywh(item.current_bbox, item_search_bbox)
+        coverage_sum += float(coverage)
+        min_coverage = min(min_coverage, float(coverage))
+        area_ratio_sum += bbox_area_xywh(item_search_bbox) / max(1.0, bbox_area_xywh(item.current_bbox))
+        if not bbox_contains_center_xywh(item_search_bbox, item.current_bbox):
+            target_center_outside_search += 1
         if pos_y.stop > pos_y.start and pos_x.stop > pos_x.start:
             ys = torch_module.arange(pos_y.start, pos_y.stop, device=device, dtype=torch_module.float32)[:, None]
             xs = torch_module.arange(pos_x.start, pos_x.stop, device=device, dtype=torch_module.float32)[None, :]
@@ -752,6 +991,11 @@ def make_lorat_style_targets(
         positive_cells_outside_search=positive_outside_search,
         hard_negative_cells=int(hard_negative_mask.sum().detach().item()),
         missing_targets=sum(1 for item in objects if not item.is_present),
+        present_targets=present_targets,
+        target_center_outside_search=target_center_outside_search,
+        mean_target_search_coverage=(coverage_sum / float(present_targets)) if present_targets else 1.0,
+        min_target_search_coverage=min_coverage if present_targets else 1.0,
+        mean_search_target_area_ratio=(area_ratio_sum / float(present_targets)) if present_targets else 0.0,
     )
     return target_scores, positive_mask, hard_negative_mask, loss_mask, positive_weights, target_boxes_xyxy, target_ltrb_offsets, stats
 
@@ -813,6 +1057,198 @@ def decode_predictions(trainer: v8.V8QualityBatchedLoRATTracker, head_output, ob
     return predictions
 
 
+def diagnostic_bbox_text(bbox: BBox) -> str:
+    return ",".join(f"{float(value):.2f}" for value in bbox)
+
+
+def prediction_diagnostic_rows(
+    trainer: v8.V8QualityBatchedLoRATTracker,
+    sample: V8TrainingSample,
+    head_output,
+    objects: Sequence[V8TrainingObject],
+    frame_shape: Tuple[int, ...],
+    epoch: int,
+    step: int,
+) -> List[Dict[str, object]]:
+    torch = trainer.torch
+    score_maps = head_output.score_maps.detach().to(torch.float32)
+    decoded_boxes = decode_box_maps_xyxy(
+        torch,
+        head_output.box_delta_maps.detach(),
+        objects,
+        frame_shape,
+        trainer.device,
+    )
+    object_count, grid_height, grid_width = score_maps.shape
+    rows: List[Dict[str, object]] = []
+    for index, item in enumerate(objects):
+        if not item.is_present:
+            continue
+        search_y, search_x = bbox_to_grid_slice(
+            expanded_training_search_bbox(item, trainer.search_radius_factor),
+            frame_shape,
+            grid_height,
+            grid_width,
+        )
+        pos_y, pos_x = bbox_to_grid_slice(item.current_bbox, frame_shape, grid_height, grid_width)
+        search_scores = score_maps[index, search_y, search_x]
+        if search_scores.numel() == 0:
+            continue
+        local_flat = int(torch.argmax(search_scores.reshape(-1)).detach().item())
+        local_w = int(search_x.stop - search_x.start)
+        best_y = int(search_y.start + (local_flat // max(1, local_w)))
+        best_x = int(search_x.start + (local_flat % max(1, local_w)))
+        best_box_xyxy = decoded_boxes[index, best_y, best_x].detach().cpu().tolist()
+        prediction = (
+            float(best_box_xyxy[0]),
+            float(best_box_xyxy[1]),
+            max(1.0, float(best_box_xyxy[2] - best_box_xyxy[0])),
+            max(1.0, float(best_box_xyxy[3] - best_box_xyxy[1])),
+        )
+        gt_center_x, gt_center_y = bbox_center(item.current_bbox)
+        gt_grid_x = max(0, min(grid_width - 1, int((gt_center_x / max(1.0, float(frame_shape[1]))) * grid_width)))
+        gt_grid_y = max(0, min(grid_height - 1, int((gt_center_y / max(1.0, float(frame_shape[0]))) * grid_height)))
+        gt_cell_box_xyxy = decoded_boxes[index, gt_grid_y, gt_grid_x].detach().cpu().tolist()
+        gt_cell_prediction = (
+            float(gt_cell_box_xyxy[0]),
+            float(gt_cell_box_xyxy[1]),
+            max(1.0, float(gt_cell_box_xyxy[2] - gt_cell_box_xyxy[0])),
+            max(1.0, float(gt_cell_box_xyxy[3] - gt_cell_box_xyxy[1])),
+        )
+        positive_scores = score_maps[index, pos_y, pos_x]
+        positive_inside_y_start = max(pos_y.start, search_y.start)
+        positive_inside_y_stop = min(pos_y.stop, search_y.stop)
+        positive_inside_x_start = max(pos_x.start, search_x.start)
+        positive_inside_x_stop = min(pos_x.stop, search_x.stop)
+        positive_inside_count = max(0, positive_inside_y_stop - positive_inside_y_start) * max(
+            0,
+            positive_inside_x_stop - positive_inside_x_start,
+        )
+        if positive_inside_count > 0:
+            positive_inside_scores = score_maps[
+                index,
+                positive_inside_y_start:positive_inside_y_stop,
+                positive_inside_x_start:positive_inside_x_stop,
+            ]
+            best_positive_logit = float(positive_inside_scores.max().detach().item())
+            better_than_positive = int((search_scores > best_positive_logit).sum().detach().item())
+        elif positive_scores.numel() > 0:
+            best_positive_logit = float(positive_scores.max().detach().item())
+            better_than_positive = int((search_scores > best_positive_logit).sum().detach().item())
+        else:
+            best_positive_logit = float("nan")
+            better_than_positive = -1
+        row = {
+            "epoch": epoch,
+            "step": step,
+            "sequence": sample.sequence_path.name,
+            "frame": int(sample.frame_number),
+            "object_index": index,
+            "track_id": int(item.track_id),
+            "target_kind": item.target_kind,
+            "iou": exercise.bbox_iou(prediction, item.current_bbox),
+            "gt_center_cell_iou": exercise.bbox_iou(gt_cell_prediction, item.current_bbox),
+            "pred_bbox": diagnostic_bbox_text(prediction),
+            "gt_bbox": diagnostic_bbox_text(item.current_bbox),
+            "previous_bbox": diagnostic_bbox_text(item.previous_bbox),
+            "search_bbox": diagnostic_bbox_text(expanded_training_search_bbox(item, trainer.search_radius_factor)),
+            "target_search_coverage": bbox_coverage_xywh(item.current_bbox, expanded_training_search_bbox(item, trainer.search_radius_factor)),
+            "target_center_in_search": int(bbox_contains_center_xywh(expanded_training_search_bbox(item, trainer.search_radius_factor), item.current_bbox)),
+            "search_target_area_ratio": bbox_area_xywh(expanded_training_search_bbox(item, trainer.search_radius_factor)) / max(1.0, bbox_area_xywh(item.current_bbox)),
+            "best_grid_x": best_x,
+            "best_grid_y": best_y,
+            "gt_center_grid_x": gt_grid_x,
+            "gt_center_grid_y": gt_grid_y,
+            "best_score": float(torch.sigmoid(score_maps[index, best_y, best_x]).detach().item()),
+            "gt_center_score": float(torch.sigmoid(score_maps[index, gt_grid_y, gt_grid_x]).detach().item()),
+            "best_positive_score": float(torch.sigmoid(torch.tensor(best_positive_logit)).item()) if np.isfinite(best_positive_logit) else "",
+            "search_cells": int(search_scores.numel()),
+            "positive_cells": int((pos_y.stop - pos_y.start) * (pos_x.stop - pos_x.start)),
+            "positive_inside_search_cells": int(positive_inside_count),
+            "search_scores_better_than_best_positive": int(better_than_positive),
+        }
+        rows.append(row)
+    return rows
+
+
+def append_diagnostic_rows(path: Path, rows: Sequence[Dict[str, object]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists()
+    fieldnames: List[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+    with path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def draw_debug_bbox(image: np.ndarray, bbox: BBox, color: Tuple[int, int, int], label: str) -> None:
+    x, y, w, h = bbox
+    x1 = int(round(x))
+    y1 = int(round(y))
+    x2 = int(round(x + w))
+    y2 = int(round(y + h))
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+    cv2.putText(image, label, (x1, max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+
+def save_prediction_debug_visuals(
+    trainer: v8.V8QualityBatchedLoRATTracker,
+    output_dir: Path,
+    sample: V8TrainingSample,
+    frame: np.ndarray,
+    head_output,
+    objects: Sequence[V8TrainingObject],
+    rows: Sequence[Dict[str, object]],
+    epoch: int,
+    step: int,
+    max_visuals_remaining: int,
+) -> int:
+    if max_visuals_remaining <= 0 or not rows:
+        return 0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch = trainer.torch
+    score_maps = head_output.score_maps.detach().to(torch.float32)
+    saved = 0
+    frame_height, frame_width = frame.shape[:2]
+    for row in rows:
+        if saved >= max_visuals_remaining:
+            break
+        index = int(row["object_index"])
+        item = objects[index]
+        image = frame.copy()
+        draw_debug_bbox(image, expanded_training_search_bbox(item, trainer.search_radius_factor), (0, 255, 255), "search")
+        draw_debug_bbox(image, item.previous_bbox, (255, 128, 0), "prev")
+        draw_debug_bbox(image, item.current_bbox, (0, 255, 0), "gt")
+        pred_values = tuple(float(value) for value in str(row["pred_bbox"]).split(","))
+        draw_debug_bbox(image, pred_values, (0, 0, 255), "pred")
+        score_map = torch.sigmoid(score_maps[index]).detach().cpu().numpy().astype(np.float32)
+        score_map = score_map - float(score_map.min())
+        score_map = score_map / max(1e-6, float(score_map.max()))
+        heat = cv2.resize(score_map, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST)
+        heat = cv2.applyColorMap(np.uint8(np.clip(heat * 255.0, 0, 255)), cv2.COLORMAP_JET)
+        composite = np.hstack((image, cv2.addWeighted(frame, 0.45, heat, 0.55, 0.0)))
+        text = (
+            f"IoU {float(row['iou']):.3f} | gt-cell IoU {float(row['gt_center_cell_iou']):.3f} | "
+            f"coverage {float(row['target_search_coverage']):.3f} | better-pos {row['search_scores_better_than_best_positive']}"
+        )
+        cv2.putText(composite, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(composite, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+        name = (
+            f"epoch{epoch:03d}_step{step:07d}_{sample.sequence_path.name}_"
+            f"f{int(sample.frame_number):06d}_trk{int(item.track_id)}_{item.target_kind}.jpg"
+        )
+        cv2.imwrite(str(output_dir / name), composite)
+        saved += 1
+    return saved
+
+
 def contrastive_reid_loss(
     torch_module,
     trainer: v8.V8QualityBatchedLoRATTracker,
@@ -861,6 +1297,113 @@ def contrastive_reid_loss(
     return 0.5 * ((row_log_den - row_log_pos).mean() + (col_log_den - col_log_pos).mean())
 
 
+def grid_cell_for_bbox_center(bbox: BBox, frame_shape: Tuple[int, ...], grid_height: int, grid_width: int) -> Tuple[int, int]:
+    center_x, center_y = bbox_center(bbox)
+    frame_height, frame_width = frame_shape[:2]
+    grid_x = int((center_x / max(1.0, float(frame_width))) * float(grid_width))
+    grid_y = int((center_y / max(1.0, float(frame_height))) * float(grid_height))
+    grid_x = max(0, min(grid_width - 1, grid_x))
+    grid_y = max(0, min(grid_height - 1, grid_y))
+    return grid_y, grid_x
+
+
+def dcfst_candidate_discrimination_loss(
+    torch_module,
+    trainer: v8.V8QualityBatchedLoRATTracker,
+    head_output,
+    objects: Sequence[V8TrainingObject],
+    frame_shape: Tuple[int, ...],
+    negative_candidate_count: int,
+    margin: float,
+) -> Tuple[object, V8CandidateDiscriminationStats]:
+    score_maps = head_output.score_maps.to(torch_module.float32)
+    if score_maps.numel() == 0 or len(objects) == 0:
+        return score_maps.sum() * 0.0, V8CandidateDiscriminationStats()
+
+    _, grid_height, grid_width = score_maps.shape
+    total_loss = score_maps.sum() * 0.0
+    object_terms = 0
+    positive_candidates = 0
+    negative_candidates = 0
+
+    for index, item in enumerate(objects):
+        if not item.is_present:
+            continue
+        pos_y, pos_x = bbox_to_grid_slice(item.current_bbox, frame_shape, grid_height, grid_width)
+        positive_logits = score_maps[index, pos_y, pos_x].reshape(-1)
+        if positive_logits.numel() == 0:
+            continue
+        positive_logit = torch_module.logsumexp(positive_logits, dim=0) - torch_module.log(
+            torch_module.as_tensor(float(positive_logits.numel()), device=trainer.device, dtype=torch_module.float32)
+        )
+        positive_candidates += int(positive_logits.numel())
+
+        search_y, search_x = bbox_to_grid_slice(
+            expanded_training_search_bbox(item, trainer.search_radius_factor),
+            frame_shape,
+            grid_height,
+            grid_width,
+        )
+        candidate_cells: List[Tuple[int, int]] = []
+        seen = set()
+
+        def add_cell(grid_y: int, grid_x: int) -> None:
+            if grid_y < search_y.start or grid_y >= search_y.stop or grid_x < search_x.start or grid_x >= search_x.stop:
+                return
+            if pos_y.start <= grid_y < pos_y.stop and pos_x.start <= grid_x < pos_x.stop:
+                return
+            key = (int(grid_y), int(grid_x))
+            if key in seen:
+                return
+            seen.add(key)
+            candidate_cells.append(key)
+
+        for distractor_bbox in item.distractor_bboxes:
+            if not bbox_contains_center_xywh(expanded_training_search_bbox(item, trainer.search_radius_factor), distractor_bbox):
+                continue
+            if not bbox_center_inside_frame(distractor_bbox, frame_shape):
+                continue
+            grid_y, grid_x = grid_cell_for_bbox_center(distractor_bbox, frame_shape, grid_height, grid_width)
+            add_cell(grid_y, grid_x)
+
+        max_background = max(0, int(negative_candidate_count) - len(candidate_cells))
+        if max_background > 0:
+            ys = np.linspace(search_y.start, max(search_y.start, search_y.stop - 1), num=max(1, int(np.sqrt(max_background)) + 1), dtype=np.int64)
+            xs = np.linspace(search_x.start, max(search_x.start, search_x.stop - 1), num=max(1, int(np.sqrt(max_background)) + 1), dtype=np.int64)
+            for grid_y in ys.tolist():
+                for grid_x in xs.tolist():
+                    add_cell(int(grid_y), int(grid_x))
+                    if len(candidate_cells) >= int(negative_candidate_count):
+                        break
+                if len(candidate_cells) >= int(negative_candidate_count):
+                    break
+
+        if not candidate_cells:
+            continue
+        candidate_cells = candidate_cells[: max(1, int(negative_candidate_count))]
+        neg_y = torch_module.as_tensor([cell[0] for cell in candidate_cells], device=trainer.device, dtype=torch_module.long)
+        neg_x = torch_module.as_tensor([cell[1] for cell in candidate_cells], device=trainer.device, dtype=torch_module.long)
+        negative_logits = score_maps[index, neg_y, neg_x]
+        if negative_logits.numel() == 0:
+            continue
+
+        ranking_logits = torch_module.cat((positive_logit.reshape(1), negative_logits.reshape(-1)), dim=0)
+        ranking_target = torch_module.zeros((1,), device=trainer.device, dtype=torch_module.long)
+        cross_entropy = torch_module.nn.functional.cross_entropy(ranking_logits.reshape(1, -1), ranking_target)
+        hard_negative_margin = torch_module.nn.functional.softplus(negative_logits - positive_logit + float(margin)).mean()
+        total_loss = total_loss + cross_entropy + hard_negative_margin
+        object_terms += 1
+        negative_candidates += int(negative_logits.numel())
+
+    if object_terms <= 0:
+        return score_maps.sum() * 0.0, V8CandidateDiscriminationStats()
+    return total_loss / float(object_terms), V8CandidateDiscriminationStats(
+        objects=object_terms,
+        positive_candidates=positive_candidates,
+        negative_candidates=negative_candidates,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the V8 shared-frame LoRAT object-conditioned LoRA head.")
     parser.add_argument("--dataset-root", type=Path, default=exercise.DEFAULT_DATASET_ROOT)
@@ -886,12 +1429,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search-scale-jitter", type=float, default=0.25, help="LoRaT training search scale jitter.")
     parser.add_argument("--search-translation-jitter", type=float, default=3.0, help="LoRaT training search translation jitter.")
     parser.add_argument("--search-min-object-size", type=float, default=10.0, help="Minimum object size in the LoRaT search crop.")
+    parser.add_argument(
+        "--search-anchor-mode",
+        default="current",
+        choices=("current", "previous", "union"),
+        help="Which box anchors supervised search regions. LoRaT-style training uses current-frame target boxes.",
+    )
+    parser.add_argument(
+        "--disable-search-target-repair",
+        dest="repair_search_to_target",
+        action="store_false",
+        default=True,
+        help="Do not expand jittered training search regions that fail to cover the positive target.",
+    )
+    parser.add_argument(
+        "--search-target-padding-fraction",
+        type=float,
+        default=0.05,
+        help="Extra padding added when repairing a training search region to include the target.",
+    )
     parser.add_argument("--template-sampling", default="mixed", choices=("first", "previous", "mixed", "window"), help="Use initial, recent previous, mixed, or random short-window template frames for training.")
     parser.add_argument("--previous-box-jitter", type=float, default=0.10, help="Relative jitter applied to previous boxes before search-region construction.")
     parser.add_argument("--sequence-window-length", type=int, default=5, help="Number of recent same-track annotations available for short-window template sampling.")
     parser.add_argument("--lost-target-probability", type=float, default=0.10, help="Probability of adding a recently visible but currently absent track as a no-confident-target training query.")
     parser.add_argument("--max-lost-targets-per-frame", type=int, default=2, help="Maximum missing/lost target queries added to one training frame.")
     parser.add_argument("--max-missing-gap-frames", type=int, default=30, help="Only sample missing-target queries within this many frames of the last visible annotation.")
+    parser.add_argument(
+        "--training-frame-mode",
+        default="staged",
+        choices=("full", "search_crop", "staged"),
+        help="Train on full shared frames, LoRaT-style search crops, or search crops for the first --crop-stage-epochs then full frames.",
+    )
+    parser.add_argument(
+        "--crop-stage-epochs",
+        type=int,
+        default=2,
+        help="When --training-frame-mode=staged, train on LoRaT-style search crops for this many initial epochs.",
+    )
     parser.add_argument(
         "--disable-lorat-augmentation",
         dest="lorat_augmentation",
@@ -911,11 +1485,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--box-loss-weight", type=float, default=1.0)
     parser.add_argument("--ltrb-loss-weight", type=float, default=1.0, help="SmoothL1 loss weight on LoRaT-style normalized l/t/r/b offsets.")
-    parser.add_argument("--reid-loss-weight", type=float, default=0.25, help="Contrastive same-track/different-track ReID loss weight.")
+    parser.add_argument("--reid-loss-weight", type=float, default=0.50, help="Contrastive same-track/different-track ReID loss weight.")
     parser.add_argument("--center-positive-weight", type=float, default=0.5, help="0 keeps LoRaT uniform positives; higher values emphasize positive cells near the target center for box losses.")
     parser.add_argument("--negative-loss-weight", type=float, default=1.0)
-    parser.add_argument("--hard-negative-loss-weight", type=float, default=2.0, help="Extra BCE weight for cells covered by other visible track boxes.")
+    parser.add_argument("--hard-negative-loss-weight", type=float, default=3.0, help="Extra BCE weight for cells covered by other visible track boxes.")
     parser.add_argument("--focal-loss-gamma", type=float, default=2.0, help="Focal-style objectness modulation gamma. 0 keeps plain LoRaT-style BCE.")
+    parser.add_argument("--dcfst-discrimination-weight", type=float, default=0.70, help="Weight for selected-target-vs-distractor candidate ranking loss.")
+    parser.add_argument("--dcfst-negative-candidates", type=int, default=48, help="Maximum distractor/background candidate cells per object for DCFST-style ranking.")
+    parser.add_argument("--dcfst-margin", type=float, default=0.35, help="Margin used by DCFST-style hard-negative ranking.")
     parser.add_argument(
         "--disable-iou-aware-classification",
         dest="iou_aware_classification",
@@ -932,16 +1509,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gaussian-sigma", type=float, default=1.25, help="Legacy option retained for compatibility; not used by LoRAT-style targets.")
     parser.add_argument("--clip-max-norm", type=float, default=1.0)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--lorat-root", type=Path, default=v8.v5.DEFAULT_LORAT_ROOT)
-    parser.add_argument("--lorat-config", default="B-224", choices=tuple(v8.v5.LORAT_WEIGHT_BY_CONFIG))
+    parser.add_argument("--lorat-root", type=Path, default=mot.DEFAULT_LORAT_ROOT)
+    parser.add_argument("--lorat-config", default="B-224", choices=tuple(mot.LORAT_WEIGHT_BY_CONFIG))
     parser.add_argument("--weight-path", type=Path, help="LoRAT backbone weight. Defaults from --lorat-config.")
     parser.add_argument("--disable-amp", action="store_true")
     parser.add_argument("--v8-head-hidden-dim", type=int, default=256)
     parser.add_argument("--v8-head-lora-rank", type=int, default=16)
-    parser.add_argument("--v8-head-rank", type=int, default=v8.v5.DEFAULT_LORAT_MEMORY_SLOTS)
+    parser.add_argument("--v8-head-rank", type=int, default=mot.DEFAULT_LORAT_MEMORY_SLOTS)
     parser.add_argument("--v8-search-radius-factor", type=float, default=2.25)
     parser.add_argument("--resume-head", type=Path)
-    parser.add_argument("--output", type=Path, default=v8.v5.PROJECT_ROOT / "models" / "lorat" / "v8_head.pt")
+    parser.add_argument("--output", type=Path, default=mot.PROJECT_ROOT / "models" / "lorat" / "v8_head.pt")
     parser.add_argument(
         "--checkpoint-interval",
         type=int,
@@ -966,6 +1543,14 @@ def parse_args() -> argparse.Namespace:
         help="Force a tiny one-sequence training run and fail the process if the train probe does not pass the quality gate.",
     )
     parser.add_argument("--overfit-smoke-samples", type=int, default=16)
+    parser.add_argument("--overfit-single-object", action="store_true", help="Limit samples to one object each for target-geometry/overfit debugging.")
+    parser.add_argument("--debug-sequence-name", help="Optional exact sequence folder name to train/debug on.")
+    parser.add_argument("--debug-track-id", type=int, help="Optional exact track id to train/debug on.")
+    parser.add_argument("--geometry-diagnostic-csv", type=Path, help="Optional CSV path for per-sample geometry diagnostics.")
+    parser.add_argument("--iou-diagnostic-csv", type=Path, help="Optional CSV path for per-prediction IoU failure diagnostics.")
+    parser.add_argument("--debug-visual-dir", type=Path, help="Optional directory for visual geometry/prediction debug images.")
+    parser.add_argument("--debug-visual-samples", type=int, default=24)
+    parser.add_argument("--debug-visual-every-epoch", action="store_true")
     parser.add_argument("--quality-gate-mean-iou", type=float, default=0.0)
     parser.add_argument("--quality-gate-iou50", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -981,6 +1566,11 @@ def save_checkpoint(
     steps: int,
     val_mean_iou: Optional[float] = None,
     val_iou50: Optional[float] = None,
+    full_val_mean_iou: Optional[float] = None,
+    full_val_iou50: Optional[float] = None,
+    selection_val_mean_iou: Optional[float] = None,
+    selection_val_iou50: Optional[float] = None,
+    selection_metric_frame_mode: str = "",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch_module.save(
@@ -994,12 +1584,15 @@ def save_checkpoint(
             "gaussian_sigma": args.gaussian_sigma,
             "head_architecture": "template_patch_lora_conditioned",
             "box_parameterization": "lorat_anchor_free_ltrb",
-            "loss_style": "lorat_iou_aware_focal_bce_giou_ltrb_reid",
+            "loss_style": "lorat_iou_aware_focal_bce_giou_ltrb_reid_dcfst_candidate",
             "iou_aware_classification": args.iou_aware_classification,
             "iou_aware_warmup_steps": args.iou_aware_warmup_steps,
             "negative_loss_weight": args.negative_loss_weight,
             "hard_negative_loss_weight": args.hard_negative_loss_weight,
             "focal_loss_gamma": args.focal_loss_gamma,
+            "dcfst_discrimination_weight": args.dcfst_discrimination_weight,
+            "dcfst_negative_candidates": args.dcfst_negative_candidates,
+            "dcfst_margin": args.dcfst_margin,
             "ltrb_loss_weight": args.ltrb_loss_weight,
             "reid_loss_weight": args.reid_loss_weight,
             "center_positive_weight": args.center_positive_weight,
@@ -1011,12 +1604,17 @@ def save_checkpoint(
             "search_scale_jitter": args.search_scale_jitter,
             "search_translation_jitter": args.search_translation_jitter,
             "search_min_object_size": args.search_min_object_size,
+            "search_anchor_mode": args.search_anchor_mode,
+            "repair_search_to_target": args.repair_search_to_target,
+            "search_target_padding_fraction": args.search_target_padding_fraction,
             "template_sampling": args.template_sampling,
             "previous_box_jitter": args.previous_box_jitter,
             "sequence_window_length": args.sequence_window_length,
             "lost_target_probability": args.lost_target_probability,
             "max_lost_targets_per_frame": args.max_lost_targets_per_frame,
             "max_missing_gap_frames": args.max_missing_gap_frames,
+            "training_frame_mode": args.training_frame_mode,
+            "crop_stage_epochs": args.crop_stage_epochs,
             "lorat_augmentation": args.lorat_augmentation,
             "command": " ".join(sys.argv),
             "torch_version": getattr(torch_module, "__version__", ""),
@@ -1025,6 +1623,11 @@ def save_checkpoint(
             "cuda_device_name": torch_module.cuda.get_device_name(0) if hasattr(torch_module, "cuda") and torch_module.cuda.is_available() else "",
             "val_mean_iou": val_mean_iou,
             "val_iou50": val_iou50,
+            "full_val_mean_iou": full_val_mean_iou,
+            "full_val_iou50": full_val_iou50,
+            "selection_val_mean_iou": selection_val_mean_iou,
+            "selection_val_iou50": selection_val_iou50,
+            "selection_metric_frame_mode": selection_metric_frame_mode,
         },
         str(path),
     )
@@ -1045,7 +1648,12 @@ def build_selected_banks(
         cached_template = template_feature_cache.get(template_key) if use_cache else None
         if cached_template is None:
             template_index = exercise.frame_to_image_index(item.template_frame)
-            template_frame = load_frame(sample.image_paths[template_index])
+            template_frame = try_load_frame(
+                sample.image_paths[template_index],
+                f"template sequence={sample.sequence_path.name} frame={item.template_frame}",
+            )
+            if template_frame is None:
+                return None
             if augmentation_spec.enabled:
                 template_frame = apply_lorat_image_augmentation(template_frame, augmentation_spec, "template")
             with trainer.torch.no_grad():
@@ -1078,6 +1686,7 @@ def validate_head(
     dataset: MOTFrameHeadDataset,
     max_samples: int,
     template_feature_cache: Dict[Tuple[Path, int], Tuple[object, Tuple[int, ...]]],
+    training_frame_mode: str = "full",
 ) -> Tuple[Optional[float], Optional[float]]:
     if len(dataset) == 0 or max_samples == 0:
         return None, None
@@ -1097,18 +1706,26 @@ def validate_head(
         for sample_index in sample_indices:
             sample = dataset[sample_index]
             current_index = exercise.frame_to_image_index(sample.frame_number)
-            current_frame = load_frame(sample.image_paths[current_index])
-            frame_features = trainer.shared_frame_encoder.encode(current_frame).feature_map.detach()
-            selected_banks = build_selected_banks(trainer, sample, sample.objects, template_feature_cache)
-            head_output = head.score(frame_features, selected_banks)
-            predictions = decode_predictions(trainer, head_output, sample.objects, current_frame.shape)
-            for prediction, item in zip(predictions, sample.objects):
-                if not item.is_present:
+            current_frame = try_load_frame(
+                sample.image_paths[current_index],
+                f"validation sequence={sample.sequence_path.name} frame={sample.frame_number}",
+            )
+            if current_frame is None:
+                continue
+            for eval_frame, eval_objects, _ in crop_training_batches(current_frame, sample.objects, training_frame_mode):
+                frame_features = trainer.shared_frame_encoder.encode(eval_frame).feature_map.detach()
+                selected_banks = build_selected_banks(trainer, sample, eval_objects, template_feature_cache)
+                if selected_banks is None:
                     continue
-                iou = exercise.bbox_iou(prediction, item.current_bbox)
-                iou_sum += iou
-                hit50 += 1 if iou >= 0.5 else 0
-                count += 1
+                head_output = head.score(frame_features, selected_banks)
+                predictions = decode_predictions(trainer, head_output, eval_objects, eval_frame.shape)
+                for prediction, item in zip(predictions, eval_objects):
+                    if not item.is_present:
+                        continue
+                    iou = exercise.bbox_iou(prediction, item.current_bbox)
+                    iou_sum += iou
+                    hit50 += 1 if iou >= 0.5 else 0
+                    count += 1
 
     if was_training:
         head.module.train()
@@ -1117,11 +1734,77 @@ def validate_head(
     return iou_sum / float(count), hit50 / float(count)
 
 
+def collect_iou_failure_diagnostics(
+    trainer: v8.V8QualityBatchedLoRATTracker,
+    dataset: MOTFrameHeadDataset,
+    max_samples: int,
+    template_feature_cache: Dict[Tuple[Path, int], Tuple[object, Tuple[int, ...]]],
+    epoch: int,
+    step: int,
+    phase: str,
+    output_csv: Path,
+    visual_dir: Optional[Path] = None,
+    max_visuals: int = 0,
+    training_frame_mode: str = "full",
+) -> int:
+    if len(dataset) == 0 or max_samples == 0:
+        return 0
+    torch = trainer.torch
+    head = trainer.object_conditioned_head
+    was_training = head.module.training
+    head.module.eval()
+    saved_visuals = 0
+
+    sample_indices = list(range(len(dataset)))
+    if max_samples > 0:
+        sample_indices = sample_indices[:max_samples]
+
+    with torch.no_grad():
+        for sample_index in sample_indices:
+            sample = dataset[sample_index]
+            current_index = exercise.frame_to_image_index(sample.frame_number)
+            current_frame = try_load_frame(
+                sample.image_paths[current_index],
+                f"validation sequence={sample.sequence_path.name} frame={sample.frame_number}",
+            )
+            if current_frame is None:
+                continue
+            for diag_frame, diag_objects, diag_mode in crop_training_batches(current_frame, sample.objects, training_frame_mode):
+                frame_features = trainer.shared_frame_encoder.encode(diag_frame).feature_map.detach()
+                selected_banks = build_selected_banks(trainer, sample, diag_objects, template_feature_cache)
+                if selected_banks is None:
+                    continue
+                head_output = head.score(frame_features, selected_banks)
+                rows = prediction_diagnostic_rows(trainer, sample, head_output, diag_objects, diag_frame.shape, epoch, step)
+                for row in rows:
+                    row["phase"] = phase
+                    row["sample_index"] = sample_index
+                    row["training_frame_mode"] = diag_mode
+                append_diagnostic_rows(output_csv, rows)
+                if visual_dir is not None and saved_visuals < max_visuals:
+                    saved_visuals += save_prediction_debug_visuals(
+                        trainer,
+                        visual_dir,
+                        sample,
+                        diag_frame,
+                        head_output,
+                        diag_objects,
+                        rows,
+                        epoch,
+                        step,
+                        max_visuals - saved_visuals,
+                    )
+    if was_training:
+        head.module.train()
+    return saved_visuals
+
+
 def reid_similarity_probe(
     trainer: v8.V8QualityBatchedLoRATTracker,
     dataset: MOTFrameHeadDataset,
     max_samples: int,
     template_feature_cache: Dict[Tuple[Path, int], Tuple[object, Tuple[int, ...]]],
+    training_frame_mode: str = "full",
 ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     if len(dataset) == 0 or max_samples == 0:
         return None, None, None
@@ -1149,38 +1832,46 @@ def reid_similarity_probe(
             if len(present_objects) < 1:
                 continue
             current_index = exercise.frame_to_image_index(sample.frame_number)
-            current_frame = load_frame(sample.image_paths[current_index])
-            frame_features = trainer.shared_frame_encoder.encode(current_frame).feature_map.detach()
-            selected_banks = build_selected_banks(trainer, sample, present_objects, template_feature_cache)
-            template_vectors = []
-            current_vectors = []
-            labels = []
-            for bank, item in zip(selected_banks, present_objects):
-                if not bank:
-                    continue
-                slot = bank[0]
-                template_vectors.append((slot.vector if isinstance(slot, v8.V8TemplateMemorySlot) else slot).to(trainer.device, dtype=torch.float32))
-                current_vectors.append(trainer._feature_mean_for_bbox(frame_features, item.current_bbox, current_frame.shape).to(trainer.device, dtype=torch.float32))
-                labels.append((int(item.track_id), str(item.target_kind)))
-            if len(template_vectors) < 1:
+            current_frame = try_load_frame(
+                sample.image_paths[current_index],
+                f"diagnostic sequence={sample.sequence_path.name} frame={sample.frame_number}",
+            )
+            if current_frame is None:
                 continue
-            template_embeddings = head.module.project_reid(torch.stack(template_vectors, dim=0))
-            current_embeddings = head.module.project_reid(torch.stack(current_vectors, dim=0))
-            similarity = torch.matmul(template_embeddings, current_embeddings.transpose(0, 1))
-            for row, left in enumerate(labels):
-                row_positive_cols = [col for col, right in enumerate(labels) if right == left]
-                row_negative_cols = [col for col, right in enumerate(labels) if right != left]
-                if row_positive_cols:
-                    same_values = similarity[row, row_positive_cols]
-                    same_sum += float(same_values.sum().detach().item())
-                    same_count += int(same_values.numel())
-                    best_col = int(torch.argmax(similarity[row]).detach().item())
-                    top1_count += 1 if labels[best_col] == left else 0
-                    top1_total += 1
-                if row_negative_cols:
-                    diff_values = similarity[row, row_negative_cols]
-                    diff_sum += float(diff_values.sum().detach().item())
-                    diff_count += int(diff_values.numel())
+            for probe_frame, probe_objects, _ in crop_training_batches(current_frame, present_objects, training_frame_mode):
+                frame_features = trainer.shared_frame_encoder.encode(probe_frame).feature_map.detach()
+                selected_banks = build_selected_banks(trainer, sample, probe_objects, template_feature_cache)
+                if selected_banks is None:
+                    continue
+                template_vectors = []
+                current_vectors = []
+                labels = []
+                for bank, item in zip(selected_banks, probe_objects):
+                    if not bank:
+                        continue
+                    slot = bank[0]
+                    template_vectors.append((slot.vector if isinstance(slot, v8.V8TemplateMemorySlot) else slot).to(trainer.device, dtype=torch.float32))
+                    current_vectors.append(trainer._feature_mean_for_bbox(frame_features, item.current_bbox, probe_frame.shape).to(trainer.device, dtype=torch.float32))
+                    labels.append((int(item.track_id), str(item.target_kind)))
+                if len(template_vectors) < 1:
+                    continue
+                template_embeddings = head.module.project_reid(torch.stack(template_vectors, dim=0))
+                current_embeddings = head.module.project_reid(torch.stack(current_vectors, dim=0))
+                similarity = torch.matmul(template_embeddings, current_embeddings.transpose(0, 1))
+                for row, left in enumerate(labels):
+                    row_positive_cols = [col for col, right in enumerate(labels) if right == left]
+                    row_negative_cols = [col for col, right in enumerate(labels) if right != left]
+                    if row_positive_cols:
+                        same_values = similarity[row, row_positive_cols]
+                        same_sum += float(same_values.sum().detach().item())
+                        same_count += int(same_values.numel())
+                        best_col = int(torch.argmax(similarity[row]).detach().item())
+                        top1_count += 1 if labels[best_col] == left else 0
+                        top1_total += 1
+                    if row_negative_cols:
+                        diff_values = similarity[row, row_negative_cols]
+                        diff_sum += float(diff_values.sum().detach().item())
+                        diff_count += int(diff_values.numel())
 
     if was_training:
         head.module.train()
@@ -1191,13 +1882,7 @@ def reid_similarity_probe(
 
 
 def append_diagnostic_row(path: Path, row: Dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not path.exists()
-    with path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    append_diagnostic_rows(path, [row])
 
 
 def main() -> int:
@@ -1211,6 +1896,11 @@ def main() -> int:
         args.train_diagnostic_samples = smoke_samples
         args.quality_gate_mean_iou = max(float(args.quality_gate_mean_iou), 0.5)
         args.quality_gate_iou50 = max(float(args.quality_gate_iou50), 0.5)
+    if args.overfit_single_object:
+        args.max_objects = 1
+        args.target_regions_per_object = 1
+        args.lost_target_probability = 0.0
+        args.max_lost_targets_per_frame = 0
     random.seed(args.seed)
     np.random.seed(args.seed)
 
@@ -1239,6 +1929,11 @@ def main() -> int:
         args.lost_target_probability,
         args.max_lost_targets_per_frame,
         args.max_missing_gap_frames,
+        args.search_anchor_mode,
+        args.repair_search_to_target,
+        args.search_target_padding_fraction,
+        args.debug_sequence_name,
+        args.debug_track_id,
     )
     if len(train_dataset) == 0:
         raise RuntimeError(f"No training samples found under {args.dataset_root} split={args.split}.")
@@ -1265,9 +1960,14 @@ def main() -> int:
         0.0,
         0,
         args.max_missing_gap_frames,
+        args.search_anchor_mode,
+        args.repair_search_to_target,
+        args.search_target_padding_fraction,
+        args.debug_sequence_name,
+        args.debug_track_id,
     )
 
-    weight_path = args.weight_path or v8.v5.LORAT_WEIGHT_BY_CONFIG[args.lorat_config]
+    weight_path = args.weight_path or mot.LORAT_WEIGHT_BY_CONFIG[args.lorat_config]
     trainer = v8.V8QualityBatchedLoRATTracker(
         args.lorat_root,
         args.lorat_config,
@@ -1296,9 +1996,13 @@ def main() -> int:
     template_feature_cache: Dict[Tuple[Path, int], Tuple[object, Tuple[int, ...]]] = {}
     checkpoint_dir = args.checkpoint_dir or (args.output.parent / f"{args.output.stem}_checkpoints")
     diagnostic_csv = args.diagnostic_csv or (checkpoint_dir / f"{args.output.stem}_training_diagnostics.csv")
+    geometry_diagnostic_csv = args.geometry_diagnostic_csv or (checkpoint_dir / f"{args.output.stem}_geometry_diagnostics.csv")
+    iou_diagnostic_csv = args.iou_diagnostic_csv or (checkpoint_dir / f"{args.output.stem}_iou_failure_diagnostics.csv")
+    debug_visual_dir = args.debug_visual_dir or (checkpoint_dir / f"{args.output.stem}_debug_visuals")
     steps = 0
-    best_val_mean_iou: Optional[float] = None
+    best_selection_val_mean_iou: Optional[float] = None
     for epoch in range(1, max(1, args.epochs) + 1):
+        debug_visuals_saved = 0
         order = list(range(len(train_dataset)))
         random.shuffle(order)
         running_loss = 0.0
@@ -1306,24 +2010,47 @@ def main() -> int:
         running_box = 0.0
         running_ltrb = 0.0
         running_reid = 0.0
+        running_dcfst = 0.0
         running_positive_cells = 0
         running_loss_cells = 0
         running_hard_negative_cells = 0
+        running_dcfst_objects = 0
+        running_dcfst_positive_candidates = 0
+        running_dcfst_negative_candidates = 0
         running_missing_targets = 0
         running_positive_outside_search = 0
+        running_present_targets = 0
+        running_center_outside_search = 0
+        running_coverage_sum = 0.0
+        running_min_coverage = 1.0
+        running_area_ratio_sum = 0.0
         for sample_index in order:
             sample = train_dataset[sample_index]
             current_index = exercise.frame_to_image_index(sample.frame_number)
-            current_frame = load_frame(sample.image_paths[current_index])
+            current_frame = try_load_frame(
+                sample.image_paths[current_index],
+                f"train sequence={sample.sequence_path.name} frame={sample.frame_number}",
+            )
+            if current_frame is None:
+                continue
             augmentation_rng = deterministic_rng(sample.sequence_path, sample.frame_number, steps, f"epoch-{epoch}")
             augmentation_spec = make_lorat_augmentation_spec(augmentation_rng, bool(args.lorat_augmentation))
             train_objects = apply_search_bbox_augmentation(sample.objects, int(current_frame.shape[1]), augmentation_spec)
             if augmentation_spec.enabled:
                 current_frame = apply_lorat_image_augmentation(current_frame, augmentation_spec, "search")
+            training_frame_mode = effective_training_frame_mode(args.training_frame_mode, epoch, args.crop_stage_epochs)
+            batch_mode = training_frame_mode
+            if training_frame_mode == "search_crop":
+                crop_batches = crop_training_batches(current_frame, train_objects, "search_crop")
+                if not crop_batches:
+                    continue
+                current_frame, train_objects, batch_mode = crop_batches[steps % len(crop_batches)]
             with torch.no_grad():
                 frame_features = trainer.shared_frame_encoder.encode(current_frame).feature_map.detach()
 
             selected_banks = build_selected_banks(trainer, sample, train_objects, template_feature_cache, augmentation_spec)
+            if selected_banks is None:
+                continue
             head_output = head.score(frame_features, selected_banks)
             decoded_boxes_xyxy = decode_box_maps_xyxy(
                 torch,
@@ -1344,6 +2071,40 @@ def main() -> int:
                 args.center_positive_weight,
                 trainer.device,
             )
+            geometry_rows = []
+            for diag_index, diag_item in enumerate(train_objects):
+                if not diag_item.is_present:
+                    continue
+                search_bbox = expanded_training_search_bbox(diag_item, trainer.search_radius_factor)
+                geometry_rows.append(
+                    {
+                        "epoch": epoch,
+                        "step": steps,
+                        "sample_index": sample_index,
+                        "sequence": sample.sequence_path.name,
+                        "frame": int(sample.frame_number),
+                        "object_index": diag_index,
+                        "track_id": int(diag_item.track_id),
+                        "target_kind": diag_item.target_kind,
+                        "current_bbox": diagnostic_bbox_text(diag_item.current_bbox),
+                        "previous_bbox": diagnostic_bbox_text(diag_item.previous_bbox),
+                        "template_bbox": diagnostic_bbox_text(diag_item.template_bbox),
+                        "search_bbox": diagnostic_bbox_text(search_bbox),
+                        "target_search_coverage": bbox_coverage_xywh(diag_item.current_bbox, search_bbox),
+                        "target_center_in_search": int(bbox_contains_center_xywh(search_bbox, diag_item.current_bbox)),
+                        "search_target_area_ratio": bbox_area_xywh(search_bbox) / max(1.0, bbox_area_xywh(diag_item.current_bbox)),
+                        "positive_cells": target_stats.positive_cells,
+                        "loss_cells": target_stats.loss_cells,
+                        "positive_cells_outside_search": target_stats.positive_cells_outside_search,
+                        "missing_targets": target_stats.missing_targets,
+                        "training_frame_mode": batch_mode,
+                        "distractor_bboxes": len(diag_item.distractor_bboxes),
+                        "search_anchor_mode": args.search_anchor_mode,
+                        "repair_search_to_target": int(bool(args.repair_search_to_target)),
+                    }
+                )
+            if geometry_rows and (steps < max(100, int(args.debug_visual_samples)) or target_stats.positive_cells_outside_search > 0):
+                append_diagnostic_rows(geometry_diagnostic_csv, geometry_rows)
             objectness_logits = head_output.score_maps.to(torch.float32)
             objectness_map = F.binary_cross_entropy_with_logits(
                 objectness_logits,
@@ -1391,11 +2152,21 @@ def main() -> int:
                 train_objects,
                 current_frame.shape,
             )
+            dcfst_loss, dcfst_stats = dcfst_candidate_discrimination_loss(
+                torch,
+                trainer,
+                head_output,
+                train_objects,
+                current_frame.shape,
+                args.dcfst_negative_candidates,
+                args.dcfst_margin,
+            )
             loss = (
                 objectness_loss
                 + (args.box_loss_weight * box_loss)
                 + (args.ltrb_loss_weight * ltrb_loss)
                 + (args.reid_loss_weight * reid_loss)
+                + (args.dcfst_discrimination_weight * dcfst_loss)
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -1409,20 +2180,59 @@ def main() -> int:
             running_box += float(box_loss.detach().item())
             running_ltrb += float(ltrb_loss.detach().item())
             running_reid += float(reid_loss.detach().item())
+            running_dcfst += float(dcfst_loss.detach().item())
             running_positive_cells += target_stats.positive_cells
             running_loss_cells += target_stats.loss_cells
             running_hard_negative_cells += target_stats.hard_negative_cells
+            running_dcfst_objects += int(dcfst_stats.objects)
+            running_dcfst_positive_candidates += int(dcfst_stats.positive_candidates)
+            running_dcfst_negative_candidates += int(dcfst_stats.negative_candidates)
             running_missing_targets += target_stats.missing_targets
             running_positive_outside_search += target_stats.positive_cells_outside_search
+            running_present_targets += target_stats.present_targets
+            running_center_outside_search += target_stats.target_center_outside_search
+            running_coverage_sum += target_stats.mean_target_search_coverage * max(1, target_stats.present_targets)
+            running_min_coverage = min(running_min_coverage, target_stats.min_target_search_coverage)
+            running_area_ratio_sum += target_stats.mean_search_target_area_ratio * max(1, target_stats.present_targets)
             steps += 1
+            if (args.debug_visual_every_epoch or epoch == 1) and debug_visuals_saved < max(0, int(args.debug_visual_samples)):
+                rows = prediction_diagnostic_rows(trainer, sample, head_output, train_objects, current_frame.shape, epoch, steps)
+                if rows:
+                    for row in rows:
+                        row["phase"] = "train_step"
+                        row["sample_index"] = sample_index
+                        row["training_frame_mode"] = batch_mode
+                    append_diagnostic_rows(iou_diagnostic_csv, rows)
+                    debug_visuals_saved += save_prediction_debug_visuals(
+                        trainer,
+                        debug_visual_dir,
+                        sample,
+                        current_frame,
+                        head_output,
+                        train_objects,
+                        rows,
+                        epoch,
+                        steps,
+                        max(0, int(args.debug_visual_samples) - debug_visuals_saved),
+                    )
             if steps % 25 == 0:
+                present_denominator = max(1, running_present_targets)
                 print(
                     f"epoch={epoch} step={steps} loss={running_loss / 25.0:.4f} "
                     f"objectness={running_objectness / 25.0:.4f} giou_box={running_box / 25.0:.4f} "
                     f"ltrb={running_ltrb / 25.0:.4f} reid={running_reid / 25.0:.4f} "
+                    f"dcfst={running_dcfst / 25.0:.4f} mode={batch_mode} "
                     f"pos_cells={running_positive_cells / 25.0:.1f} loss_cells={running_loss_cells / 25.0:.1f} "
-                    f"hard_neg_cells={running_hard_negative_cells / 25.0:.1f} missing_targets={running_missing_targets / 25.0:.1f} "
+                    f"hard_neg_cells={running_hard_negative_cells / 25.0:.1f} "
+                    f"dcfst_objs={running_dcfst_objects / 25.0:.1f} "
+                    f"dcfst_pos={running_dcfst_positive_candidates / 25.0:.1f} "
+                    f"dcfst_neg={running_dcfst_negative_candidates / 25.0:.1f} "
+                    f"missing_targets={running_missing_targets / 25.0:.1f} "
                     f"pos_outside_search={running_positive_outside_search / 25.0:.1f} "
+                    f"target_center_outside={running_center_outside_search / 25.0:.1f} "
+                    f"target_search_coverage_mean={running_coverage_sum / float(present_denominator):.3f} "
+                    f"target_search_coverage_min={running_min_coverage:.3f} "
+                    f"search_target_area_ratio_mean={running_area_ratio_sum / float(present_denominator):.1f} "
                     f"iou_aware={'yes' if use_iou_aware else 'warmup'}",
                     flush=True,
                 )
@@ -1431,11 +2241,20 @@ def main() -> int:
                 running_box = 0.0
                 running_ltrb = 0.0
                 running_reid = 0.0
+                running_dcfst = 0.0
                 running_positive_cells = 0
                 running_loss_cells = 0
                 running_hard_negative_cells = 0
+                running_dcfst_objects = 0
+                running_dcfst_positive_candidates = 0
+                running_dcfst_negative_candidates = 0
                 running_missing_targets = 0
                 running_positive_outside_search = 0
+                running_present_targets = 0
+                running_center_outside_search = 0
+                running_coverage_sum = 0.0
+                running_min_coverage = 1.0
+                running_area_ratio_sum = 0.0
             if args.checkpoint_interval > 0 and steps % args.checkpoint_interval == 0:
                 step_path = checkpoint_dir / f"{args.output.stem}_epoch{epoch:03d}_step{steps:07d}.pt"
                 latest_path = checkpoint_dir / f"{args.output.stem}_latest.pt"
@@ -1445,43 +2264,144 @@ def main() -> int:
             if args.max_steps > 0 and steps >= args.max_steps:
                 break
 
+        eval_frame_mode = effective_training_frame_mode(args.training_frame_mode, epoch, args.crop_stage_epochs)
         train_mean_iou, train_iou50 = validate_head(
             trainer,
             train_dataset,
             args.train_diagnostic_samples,
             template_feature_cache,
+            eval_frame_mode,
         )
         val_mean_iou, val_iou50 = validate_head(
             trainer,
             val_dataset,
             args.max_val_samples,
             template_feature_cache,
+            eval_frame_mode,
         )
+        full_train_mean_iou = train_mean_iou
+        full_train_iou50 = train_iou50
+        full_val_mean_iou = val_mean_iou
+        full_val_iou50 = val_iou50
+        if eval_frame_mode != "full":
+            full_train_mean_iou, full_train_iou50 = validate_head(
+                trainer,
+                train_dataset,
+                args.train_diagnostic_samples,
+                template_feature_cache,
+                "full",
+            )
+            full_val_mean_iou, full_val_iou50 = validate_head(
+                trainer,
+                val_dataset,
+                args.max_val_samples,
+                template_feature_cache,
+                "full",
+            )
+        selection_metric_frame_mode = "full" if full_val_mean_iou is not None else eval_frame_mode
+        selection_val_mean_iou = full_val_mean_iou if full_val_mean_iou is not None else val_mean_iou
+        selection_val_iou50 = full_val_iou50 if full_val_iou50 is not None else val_iou50
         train_reid_same, train_reid_diff, train_reid_top1 = reid_similarity_probe(
             trainer,
             train_dataset,
             args.train_diagnostic_samples,
             template_feature_cache,
+            "full",
         )
         val_reid_same, val_reid_diff, val_reid_top1 = reid_similarity_probe(
             trainer,
             val_dataset,
             args.max_val_samples,
             template_feature_cache,
+            "full",
         )
-        save_checkpoint(torch, args.output, head, args, epoch, steps, val_mean_iou, val_iou50)
-        save_checkpoint(torch, checkpoint_dir / f"{args.output.stem}_latest.pt", head, args, epoch, steps, val_mean_iou, val_iou50)
+        debug_visuals_saved += collect_iou_failure_diagnostics(
+            trainer,
+            train_dataset,
+            min(max(0, int(args.train_diagnostic_samples)), 32),
+            template_feature_cache,
+            epoch,
+            steps,
+            "train_epoch_probe",
+            iou_diagnostic_csv,
+            debug_visual_dir if args.debug_visual_every_epoch else None,
+            max(0, int(args.debug_visual_samples) - debug_visuals_saved) if args.debug_visual_every_epoch else 0,
+            eval_frame_mode,
+        )
+        debug_visuals_saved += collect_iou_failure_diagnostics(
+            trainer,
+            val_dataset,
+            min(max(0, int(args.max_val_samples)), 32),
+            template_feature_cache,
+            epoch,
+            steps,
+            "val_epoch_probe",
+            iou_diagnostic_csv,
+            debug_visual_dir if args.debug_visual_every_epoch else None,
+            max(0, int(args.debug_visual_samples) - debug_visuals_saved) if args.debug_visual_every_epoch else 0,
+            eval_frame_mode,
+        )
+        save_checkpoint(
+            torch,
+            args.output,
+            head,
+            args,
+            epoch,
+            steps,
+            val_mean_iou,
+            val_iou50,
+            full_val_mean_iou,
+            full_val_iou50,
+            selection_val_mean_iou,
+            selection_val_iou50,
+            selection_metric_frame_mode,
+        )
+        save_checkpoint(
+            torch,
+            checkpoint_dir / f"{args.output.stem}_latest.pt",
+            head,
+            args,
+            epoch,
+            steps,
+            val_mean_iou,
+            val_iou50,
+            full_val_mean_iou,
+            full_val_iou50,
+            selection_val_mean_iou,
+            selection_val_iou50,
+            selection_metric_frame_mode,
+        )
         best_updated = False
-        if val_mean_iou is not None and (best_val_mean_iou is None or val_mean_iou > best_val_mean_iou):
-            best_val_mean_iou = float(val_mean_iou)
-            save_checkpoint(torch, checkpoint_dir / f"{args.output.stem}_best_by_val_iou.pt", head, args, epoch, steps, val_mean_iou, val_iou50)
+        if selection_val_mean_iou is not None and (
+            best_selection_val_mean_iou is None or selection_val_mean_iou > best_selection_val_mean_iou
+        ):
+            best_selection_val_mean_iou = float(selection_val_mean_iou)
+            save_checkpoint(
+                torch,
+                checkpoint_dir / f"{args.output.stem}_best_by_val_iou.pt",
+                head,
+                args,
+                epoch,
+                steps,
+                val_mean_iou,
+                val_iou50,
+                full_val_mean_iou,
+                full_val_iou50,
+                selection_val_mean_iou,
+                selection_val_iou50,
+                selection_metric_frame_mode,
+            )
             best_updated = True
         val_text = "validation skipped"
         if val_mean_iou is not None and val_iou50 is not None:
             val_text = f"val_mean_iou={val_mean_iou:.4f} val_iou50={val_iou50:.4f}"
+            if eval_frame_mode != "full" and full_val_mean_iou is not None and full_val_iou50 is not None:
+                val_text += f" full_val_mean_iou={full_val_mean_iou:.4f} full_val_iou50={full_val_iou50:.4f}"
         train_text = "train probe skipped"
         if train_mean_iou is not None and train_iou50 is not None:
             train_text = f"train_probe_mean_iou={train_mean_iou:.4f} train_probe_iou50={train_iou50:.4f}"
+            if eval_frame_mode != "full" and full_train_mean_iou is not None and full_train_iou50 is not None:
+                train_text += f" full_train_probe_mean_iou={full_train_mean_iou:.4f} full_train_probe_iou50={full_train_iou50:.4f}"
         reid_text = "reid probe skipped"
         if val_reid_top1 is not None:
             reid_text = f"val_reid_top1={val_reid_top1:.4f}"
@@ -1493,7 +2413,7 @@ def main() -> int:
                 "lorat_config": args.lorat_config,
                 "head_architecture": "template_patch_lora_conditioned",
                 "box_parameterization": "lorat_anchor_free_ltrb",
-                "loss_style": "lorat_iou_aware_focal_bce_giou_ltrb_reid",
+                "loss_style": "lorat_iou_aware_focal_bce_giou_ltrb_reid_dcfst_candidate",
                 "iou_aware_classification": int(bool(args.iou_aware_classification)),
                 "iou_aware_warmup_steps": int(args.iou_aware_warmup_steps),
                 "box_loss_weight": float(args.box_loss_weight),
@@ -1503,6 +2423,9 @@ def main() -> int:
                 "negative_loss_weight": float(args.negative_loss_weight),
                 "hard_negative_loss_weight": float(args.hard_negative_loss_weight),
                 "focal_loss_gamma": float(args.focal_loss_gamma),
+                "dcfst_discrimination_weight": float(args.dcfst_discrimination_weight),
+                "dcfst_negative_candidates": int(args.dcfst_negative_candidates),
+                "dcfst_margin": float(args.dcfst_margin),
                 "search_radius_factor": float(trainer.search_radius_factor),
                 "target_region_mode": args.target_region_mode,
                 "target_regions_per_object": int(args.target_regions_per_object),
@@ -1511,28 +2434,45 @@ def main() -> int:
                 "search_scale_jitter": float(args.search_scale_jitter),
                 "search_translation_jitter": float(args.search_translation_jitter),
                 "search_min_object_size": float(args.search_min_object_size),
+                "search_anchor_mode": args.search_anchor_mode,
+                "repair_search_to_target": int(bool(args.repair_search_to_target)),
+                "search_target_padding_fraction": float(args.search_target_padding_fraction),
                 "template_sampling": args.template_sampling,
                 "previous_box_jitter": float(args.previous_box_jitter),
                 "sequence_window_length": int(args.sequence_window_length),
                 "lost_target_probability": float(args.lost_target_probability),
                 "max_lost_targets_per_frame": int(args.max_lost_targets_per_frame),
                 "max_missing_gap_frames": int(args.max_missing_gap_frames),
+                "training_frame_mode": args.training_frame_mode,
+                "effective_training_frame_mode": eval_frame_mode,
+                "checkpoint_selection_frame_mode": selection_metric_frame_mode,
+                "crop_stage_epochs": int(args.crop_stage_epochs),
+                "debug_sequence_name": args.debug_sequence_name or "",
+                "debug_track_id": "" if args.debug_track_id is None else int(args.debug_track_id),
+                "overfit_single_object": int(bool(args.overfit_single_object)),
                 "lorat_augmentation": int(bool(args.lorat_augmentation)),
                 "train_probe_mean_iou": train_mean_iou,
                 "train_probe_iou50": train_iou50,
                 "val_mean_iou": val_mean_iou,
                 "val_iou50": val_iou50,
+                "full_train_probe_mean_iou": full_train_mean_iou,
+                "full_train_probe_iou50": full_train_iou50,
+                "full_val_mean_iou": full_val_mean_iou,
+                "full_val_iou50": full_val_iou50,
+                "selection_val_mean_iou": selection_val_mean_iou,
+                "selection_val_iou50": selection_val_iou50,
+                "reid_probe_frame_mode": "full",
                 "train_reid_same_cosine": train_reid_same,
                 "train_reid_diff_cosine": train_reid_diff,
                 "train_reid_top1": train_reid_top1,
                 "val_reid_same_cosine": val_reid_same,
                 "val_reid_diff_cosine": val_reid_diff,
                 "val_reid_top1": val_reid_top1,
-                "best_val_mean_iou": best_val_mean_iou,
+                "best_selection_val_mean_iou": best_selection_val_mean_iou,
                 "best_updated": int(best_updated),
             },
         )
-        best_text = "best updated" if best_updated else f"best_val_mean_iou={best_val_mean_iou:.4f}" if best_val_mean_iou is not None else "best pending"
+        best_text = "best updated" if best_updated else f"best_selection_val_mean_iou={best_selection_val_mean_iou:.4f}" if best_selection_val_mean_iou is not None else "best pending"
         print(f"Saved V8 head checkpoint to {args.output} ({train_text}; {val_text}; {reid_text}; {best_text})", flush=True)
         if args.max_steps > 0 and steps >= args.max_steps:
             break
@@ -1541,8 +2481,8 @@ def main() -> int:
     gate_mean = float(args.quality_gate_mean_iou)
     gate_iou50 = float(args.quality_gate_iou50)
     if gate_mean > 0.0 or gate_iou50 > 0.0:
-        probe_mean = train_mean_iou if args.overfit_smoke else val_mean_iou
-        probe_iou50 = train_iou50 if args.overfit_smoke else val_iou50
+        probe_mean = full_train_mean_iou if args.overfit_smoke else full_val_mean_iou
+        probe_iou50 = full_train_iou50 if args.overfit_smoke else full_val_iou50
         passed = (
             probe_mean is not None
             and probe_iou50 is not None

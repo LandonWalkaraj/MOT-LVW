@@ -27,6 +27,8 @@ That gives you DanceTrack validation data, MOT17 labels, and TAO labels. Pull fu
 
 ## Datasets
 
+For additional training data beyond the required week-one assets, see `docs/core_training_dataset_candidates.md`. The short version is: keep DanceTrack/MOT17 as the benchmark-aligned core, then add SOT data such as GOT-10k/LaSOT/TrackingNet, identity-heavy MOT data such as MOT20/PersonPath22/SportsMOT, and open-world video data such as TAO/BURST.
+
 | Dataset | Source | What to use this week | Notes |
 | --- | --- | --- | --- |
 | DanceTrack | [official repo](https://github.com/DanceTrack/DanceTrack), [Hugging Face mirror](https://huggingface.co/datasets/noahcao/dancetrack) | Use train and val for local timing, quality, and small-object benchmarks. | Designed to stress association under similar appearance and diverse motion, which is exactly useful for multi-object LoRAT plus re-ID. |

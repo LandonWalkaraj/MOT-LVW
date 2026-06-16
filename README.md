@@ -6,6 +6,10 @@ Project goal:
 
 > Implement LoRAT for multi-object tracking on GPU/CUDA, exercise it on DanceTrack and MOT17, and provide a graphical interface where a user can place multiple bounding boxes and track all selected objects at the same time.
 
+Learning guide:
+
+- Start with `docs/project_learning_guide.md` for the consolidated beginner-to-project study path covering Python/OpenCV basics, computer vision, SOT, MOT, SOT-based MOT, LoRAT/V8, training, benchmarks, and the summer deliverables.
+
 The current Git-facing deliverable is focused on three program files:
 
 - `programs/bounding_box_v3_lorat.py`: the LoRAT-backed multi-object GUI tracker.

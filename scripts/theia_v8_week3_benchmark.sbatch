@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=lorat-v8-a100
+#SBATCH --job-name=lorat-v8-week3
 #SBATCH --account=rc_general
 #SBATCH --partition=gpu-A100
 #SBATCH --nodes=1
@@ -9,7 +9,7 @@
 #SBATCH --time=08:00:00
 #SBATCH --signal=TERM@600
 #SBATCH --gres=gpu:1
-#SBATCH --output=/work/%u/lorat-v8-a100-%j.out
+#SBATCH --output=/work/%u/lorat-v8-week3-%j.out
 
 set -euo pipefail
 
@@ -20,8 +20,8 @@ fi
 
 BUNDLE="${BUNDLE:-/work/$USER/theia_lorat_v8_train_bundle.tar.gz}"
 UPDATE_ROOT="${UPDATE_ROOT:-/work/$USER/lorat-v8-live-updates}"
-RUN_ROOT="${RUN_ROOT:-/work/$USER/lorat-v8-benchmark-job-$SLURM_JOB_ID}"
-RESULT_ROOT="${RESULT_ROOT:-/work/$USER/lorat-v8-results-full}"
+RUN_ROOT="${RUN_ROOT:-/work/$USER/lorat-v8-week3-job-$SLURM_JOB_ID}"
+RESULT_ROOT="${RESULT_ROOT:-/work/$USER/lorat-v8-week3-results-full}"
 VENV_DIR="${VENV_DIR:-/work/$USER/lorat-v8-venv-cu128-$SLURM_JOB_ID}"
 PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 PIP_CACHE_DIR="${PIP_CACHE_DIR:-/work/$USER/.cache/pip}"
@@ -34,12 +34,12 @@ CLEANUP_RUN_ROOT="${CLEANUP_RUN_ROOT:-1}"
 
 TRACK_COUNTS="${TRACK_COUNTS:-1,2,3,4,5}"
 MAX_FRAMES="${MAX_FRAMES:-0}"
-SEQUENCE="${SEQUENCE:-dancetrack0065}"
+SEQUENCES="${SEQUENCES:-dancetrack0065}"
 SPLIT="${SPLIT:-val}"
-COMPARE_CONFIGS="${COMPARE_CONFIGS:-B-224 L-224 g-224}"
+COMPARE_CONFIGS="${COMPARE_CONFIGS:-B-224}"
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-25}"
 AREA_SAMPLE_INTERVAL="${AREA_SAMPLE_INTERVAL:-10}"
-IDENTITY_SAMPLE_INTERVAL="${IDENTITY_SAMPLE_INTERVAL:-10}"
+IDENTITY_SAMPLE_INTERVAL="${IDENTITY_SAMPLE_INTERVAL:-1}"
 SAVE_VIDEO="${SAVE_VIDEO:-1}"
 
 export PIP_CACHE_DIR
@@ -56,6 +56,7 @@ echo "Head weights auto-detect: $HEAD_WEIGHTS_ROOT_AUTO"
 echo "Head checkpoint preference: $HEAD_CHECKPOINT"
 echo "Dataset root override: ${DATASET_ROOT:-auto}"
 echo "Split: $SPLIT"
+echo "Sequences: $SEQUENCES"
 echo "Track counts: $TRACK_COUNTS"
 echo "Compare configs: $COMPARE_CONFIGS"
 echo "Max frames: $MAX_FRAMES"
@@ -68,7 +69,7 @@ fi
 
 mkdir -p "$RUN_ROOT" "$RESULT_ROOT" "$PIP_CACHE_DIR"
 cleanup_run_root() {
-    if [[ "$CLEANUP_RUN_ROOT" == "1" && "$RUN_ROOT" == "/work/$USER"/lorat-v8-benchmark-job-* && -d "$RUN_ROOT" ]]; then
+    if [[ "$CLEANUP_RUN_ROOT" == "1" && "$RUN_ROOT" == "/work/$USER"/lorat-v8-week3-job-* && -d "$RUN_ROOT" ]]; then
         rm -rf "$RUN_ROOT"
     fi
 }
@@ -183,20 +184,24 @@ for config in "${COMPARE_CONFIG_ARRAY[@]}"; do
     echo "Using V8 head for $config: $head_path"
 done
 
+SEQUENCE_ARGS=()
+read -r -a SEQUENCE_ARRAY <<< "$SEQUENCES"
+for sequence in "${SEQUENCE_ARRAY[@]}"; do
+    SEQUENCE_ARGS+=(--sequence "$sequence")
+done
+
 VIDEO_ARGS=()
 if [[ "$SAVE_VIDEO" == "1" || "$SAVE_VIDEO" == "true" || "$SAVE_VIDEO" == "TRUE" ]]; then
     VIDEO_ARGS+=(--save-video)
 fi
 
-echo "Selected sequence: $SEQUENCE"
-
-python programs/benchmark_lorat_v8.py \
+python programs/benchmark_lorat_week3.py \
     --dataset-root "$DATASET_ROOT" \
     --split "$SPLIT" \
     --lorat-root "$PWD/external/LoRAT-main" \
     --device cuda:0 \
     --gpu-profile hpc \
-    --sequence "$SEQUENCE" \
+    "${SEQUENCE_ARGS[@]}" \
     --track-counts "$TRACK_COUNTS" \
     --compare-configs "${COMPARE_CONFIG_ARRAY[@]}" \
     --v8-head-weights-root "$HEAD_WEIGHTS_ROOT" \
@@ -208,5 +213,5 @@ python programs/benchmark_lorat_v8.py \
     --output-root "$RESULT_ROOT" \
     "${VIDEO_ARGS[@]}"
 
-echo "Benchmark complete. Summaries:"
+echo "Week 3 benchmark complete. Summaries:"
 find "$RESULT_ROOT" -maxdepth 3 -type f -name "summary.md" -print
