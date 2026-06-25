@@ -4,9 +4,9 @@
 #SBATCH --partition=gpu-A100
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=96G
-#SBATCH --time=08:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=03:00:00
 #SBATCH --signal=TERM@600
 #SBATCH --gres=gpu:1
 #SBATCH --output=/work/%u/lorat-v8-week3-%j.out
@@ -37,10 +37,21 @@ MAX_FRAMES="${MAX_FRAMES:-0}"
 SEQUENCES="${SEQUENCES:-dancetrack0065}"
 SPLIT="${SPLIT:-val}"
 COMPARE_CONFIGS="${COMPARE_CONFIGS:-B-224}"
+INIT_SELECTION="${INIT_SELECTION:-largest}"
+INIT_MIN_AREA="${INIT_MIN_AREA:-0}"
+INIT_MAX_AREA="${INIT_MAX_AREA:-0}"
+INIT_TRACK_IDS="${INIT_TRACK_IDS:-}"
 PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-25}"
 AREA_SAMPLE_INTERVAL="${AREA_SAMPLE_INTERVAL:-10}"
 IDENTITY_SAMPLE_INTERVAL="${IDENTITY_SAMPLE_INTERVAL:-1}"
 SAVE_VIDEO="${SAVE_VIDEO:-1}"
+DINOV2_CROP_REID="${DINOV2_CROP_REID:-1}"
+DINOV2_CROP_REID_BATCH="${DINOV2_CROP_REID_BATCH:-16}"
+CONTROLLED_OCCLUSION_DURATIONS="${CONTROLLED_OCCLUSION_DURATIONS:-0,5,10,20,40,80}"
+CONTROLLED_OCCLUSION_TRIALS_PER_DURATION="${CONTROLLED_OCCLUSION_TRIALS_PER_DURATION:-3}"
+CONTROLLED_OCCLUSION_WARMUP_FRAMES="${CONTROLLED_OCCLUSION_WARMUP_FRAMES:-10}"
+CONTROLLED_OCCLUSION_RECOVERY_FRAMES="${CONTROLLED_OCCLUSION_RECOVERY_FRAMES:-30}"
+CONTROLLED_OCCLUSION_MASK="${CONTROLLED_OCCLUSION_MASK:-black}"
 
 export PIP_CACHE_DIR
 
@@ -59,8 +70,19 @@ echo "Split: $SPLIT"
 echo "Sequences: $SEQUENCES"
 echo "Track counts: $TRACK_COUNTS"
 echo "Compare configs: $COMPARE_CONFIGS"
+echo "Init selection: $INIT_SELECTION"
+echo "Init min area: $INIT_MIN_AREA"
+echo "Init max area: $INIT_MAX_AREA"
+echo "Init track ids: ${INIT_TRACK_IDS:-none}"
 echo "Max frames: $MAX_FRAMES"
 echo "Save video: $SAVE_VIDEO"
+echo "DINOv2 crop ReID: $DINOV2_CROP_REID"
+echo "DINOv2 crop ReID batch: $DINOV2_CROP_REID_BATCH"
+echo "Controlled occlusion durations: $CONTROLLED_OCCLUSION_DURATIONS"
+echo "Controlled occlusion trials/duration: $CONTROLLED_OCCLUSION_TRIALS_PER_DURATION"
+echo "Controlled occlusion warmup frames: $CONTROLLED_OCCLUSION_WARMUP_FRAMES"
+echo "Controlled occlusion recovery frames: $CONTROLLED_OCCLUSION_RECOVERY_FRAMES"
+echo "Controlled occlusion mask: $CONTROLLED_OCCLUSION_MASK"
 
 if [[ ! -f "$BUNDLE" ]]; then
     echo "Missing bundle: $BUNDLE"
@@ -82,6 +104,16 @@ if [[ -d "$UPDATE_ROOT" ]]; then
     echo "Applying live updates from: $UPDATE_ROOT"
     cp -a "$UPDATE_ROOT"/. "$PWD"/
 fi
+
+echo "Benchmark source hashes after live updates:"
+sha256sum \
+    programs/benchmark_lorat_v8.py \
+    programs/benchmark_lorat_week3.py \
+    programs/benchmark_lorat_mot.py \
+    programs/bounding_box_v8_lorat_quality_batched.py \
+    programs/mot_common.py \
+    programs/exercise_lorat_mot.py \
+    2>/dev/null || true
 
 if command -v module >/dev/null 2>&1; then
     module purge || true
@@ -136,7 +168,8 @@ if [[ -z "$DATASET_ROOT" ]]; then
 fi
 echo "Resolved dataset root: $DATASET_ROOT"
 
-read -r -a COMPARE_CONFIG_ARRAY <<< "$COMPARE_CONFIGS"
+NORMALIZED_COMPARE_CONFIGS="${COMPARE_CONFIGS//,/ }"
+read -r -a COMPARE_CONFIG_ARRAY <<< "$NORMALIZED_COMPARE_CONFIGS"
 head_root_has_configs() {
     local root="$1"
     local config key best_path latest_path
@@ -151,16 +184,25 @@ head_root_has_configs() {
     return 0
 }
 
+if [[ "$HEAD_WEIGHTS_ROOT_AUTO" == "1" || "$HEAD_WEIGHTS_ROOT_AUTO" == "true" || "$HEAD_WEIGHTS_ROOT_AUTO" == "TRUE" ]]; then
+    echo "Searching latest training outputs for requested V8 heads."
+    configured_head_root="$HEAD_WEIGHTS_ROOT"
+    while IFS= read -r candidate_root; do
+        if head_root_has_configs "$candidate_root"; then
+            HEAD_WEIGHTS_ROOT="$candidate_root"
+            if [[ "$HEAD_WEIGHTS_ROOT" != "$configured_head_root" ]]; then
+                echo "Auto-detected head weights root: $HEAD_WEIGHTS_ROOT"
+            else
+                echo "Configured head weights root is newest valid root: $HEAD_WEIGHTS_ROOT"
+            fi
+            break
+        fi
+    done < <(ls -td /work/"$USER"/lorat-v8-train-results*/checkpoints 2>/dev/null || true)
+fi
+
 if ! head_root_has_configs "$HEAD_WEIGHTS_ROOT"; then
     if [[ "$HEAD_WEIGHTS_ROOT_AUTO" == "1" || "$HEAD_WEIGHTS_ROOT_AUTO" == "true" || "$HEAD_WEIGHTS_ROOT_AUTO" == "TRUE" ]]; then
-        echo "Configured head root does not contain all requested heads; searching latest training outputs."
-        while IFS= read -r candidate_root; do
-            if head_root_has_configs "$candidate_root"; then
-                HEAD_WEIGHTS_ROOT="$candidate_root"
-                echo "Auto-detected head weights root: $HEAD_WEIGHTS_ROOT"
-                break
-            fi
-        done < <(ls -td /work/"$USER"/lorat-v8-train-results*/checkpoints 2>/dev/null || true)
+        echo "Could not auto-detect a complete V8 head root; falling back to configured root: $HEAD_WEIGHTS_ROOT"
     fi
 fi
 
@@ -185,15 +227,43 @@ for config in "${COMPARE_CONFIG_ARRAY[@]}"; do
 done
 
 SEQUENCE_ARGS=()
-read -r -a SEQUENCE_ARRAY <<< "$SEQUENCES"
+NORMALIZED_SEQUENCES="${SEQUENCES//,/ }"
+read -r -a SEQUENCE_ARRAY <<< "$NORMALIZED_SEQUENCES"
 for sequence in "${SEQUENCE_ARRAY[@]}"; do
     SEQUENCE_ARGS+=(--sequence "$sequence")
 done
+
+INIT_SELECTION_ARGS=(
+    --init-selection "$INIT_SELECTION"
+    --init-min-area "$INIT_MIN_AREA"
+    --init-max-area "$INIT_MAX_AREA"
+)
+if [[ -n "$INIT_TRACK_IDS" ]]; then
+    IFS=',' read -r -a INIT_TRACK_ID_ARRAY <<< "$INIT_TRACK_IDS"
+    for track_id in "${INIT_TRACK_ID_ARRAY[@]}"; do
+        if [[ -n "$track_id" ]]; then
+            INIT_SELECTION_ARGS+=(--init-track-id "$track_id")
+        fi
+    done
+fi
 
 VIDEO_ARGS=()
 if [[ "$SAVE_VIDEO" == "1" || "$SAVE_VIDEO" == "true" || "$SAVE_VIDEO" == "TRUE" ]]; then
     VIDEO_ARGS+=(--save-video)
 fi
+
+CROP_REID_ARGS=(--v8-dinov2-crop-reid-batch "$DINOV2_CROP_REID_BATCH")
+if [[ "$DINOV2_CROP_REID" == "0" || "$DINOV2_CROP_REID" == "false" || "$DINOV2_CROP_REID" == "FALSE" ]]; then
+    CROP_REID_ARGS+=(--disable-v8-dinov2-crop-reid)
+fi
+
+CONTROLLED_OCCLUSION_ARGS=(
+    --controlled-occlusion-durations "$CONTROLLED_OCCLUSION_DURATIONS"
+    --controlled-occlusion-trials-per-duration "$CONTROLLED_OCCLUSION_TRIALS_PER_DURATION"
+    --controlled-occlusion-warmup-frames "$CONTROLLED_OCCLUSION_WARMUP_FRAMES"
+    --controlled-occlusion-recovery-frames "$CONTROLLED_OCCLUSION_RECOVERY_FRAMES"
+    --controlled-occlusion-mask "$CONTROLLED_OCCLUSION_MASK"
+)
 
 python programs/benchmark_lorat_week3.py \
     --dataset-root "$DATASET_ROOT" \
@@ -206,10 +276,13 @@ python programs/benchmark_lorat_week3.py \
     --compare-configs "${COMPARE_CONFIG_ARRAY[@]}" \
     --v8-head-weights-root "$HEAD_WEIGHTS_ROOT" \
     --v8-head-checkpoint "$HEAD_CHECKPOINT" \
+    "${INIT_SELECTION_ARGS[@]}" \
     --max-frames "$MAX_FRAMES" \
     --progress-interval "$PROGRESS_INTERVAL" \
     --area-sample-interval "$AREA_SAMPLE_INTERVAL" \
     --identity-sample-interval "$IDENTITY_SAMPLE_INTERVAL" \
+    "${CROP_REID_ARGS[@]}" \
+    "${CONTROLLED_OCCLUSION_ARGS[@]}" \
     --output-root "$RESULT_ROOT" \
     "${VIDEO_ARGS[@]}"
 

@@ -19,7 +19,7 @@ import mot_common as mot
 
 BBox = mot.BBox
 
-V8_EXECUTION_MODE = "shared-frame-vit-batched-heads-dinov2-crop-reid"
+V8_EXECUTION_MODE = "shared-frame-vit-batched-heads-dinov2-crop-reid-open-world-proposals"
 DEFAULT_V8_PRIMARY_HEADS_PER_TRACK = 1
 DEFAULT_V8_RECOVERY_HEADS_PER_TRACK = 5
 DEFAULT_V8_RECOVERY_INTERVAL = 15
@@ -49,23 +49,6 @@ DEFAULT_V8_WINDOW_PENALTY_RATIO = 0.45
 DEFAULT_V8_DINOV2_CROP_REID = True
 DEFAULT_V8_DINOV2_CROP_REID_BATCH = 16
 DEFAULT_V8_DINOV2_CROP_REID_MIN_AREA = 9.0
-DEFAULT_V8_ASSIGNMENT_CONFLICT_IOU = 0.65
-DEFAULT_V8_ASSIGNMENT_CONFLICT_HARD_IOU = 0.82
-DEFAULT_V8_ASSIGNMENT_CONFLICT_SCORE_MARGIN = 0.04
-DEFAULT_V8_ASSIGNMENT_CONFLICT_CENTER_RATIO = 0.38
-DEFAULT_V8_ASSIGNMENT_CONFLICT_CONTAINMENT = 0.45
-DEFAULT_V8_ASSIGNMENT_CONFLICT_OWNERSHIP_MARGIN = 0.07
-DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_ENABLED = True
-DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_MAX_CANDIDATES = 4
-DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_MIN_CONFIDENCE = 0.38
-DEFAULT_V8_SMALL_TARGET_MODE = True
-DEFAULT_V8_SMALL_TARGET_AREA = 4096.0
-DEFAULT_V8_SMALL_TARGET_MAX_SIDE = 96.0
-DEFAULT_V8_SMALL_TARGET_MAX_SCALE_CHANGE = 1.35
-DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_SCORE = 0.56
-DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_MOTION = 0.25
-DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_PATH = 0.25
-DEFAULT_V8_SMALL_TARGET_CONFIDENCE_FLOOR = 0.02
 V8_PROFILE_BUCKETS = (
     "candidate_transfer",
     "candidate_extract",
@@ -334,46 +317,7 @@ class BatchedObjectConditionedHead:
             state = self.torch.load(str(path), map_location=self.device)
         if isinstance(state, dict) and "model" in state:
             state = state["model"]
-        try:
-            self.module.load_state_dict(state, strict=True)
-            loaded_keys = len(state) if isinstance(state, dict) else 0
-            print(f"V8 object head loaded: {path} ({loaded_keys} tensors, strict)", flush=True)
-        except RuntimeError as error:
-            if not isinstance(state, dict):
-                raise
-            current_state = self.module.state_dict()
-            compatible_state = {}
-            skipped_keys = []
-            for key, value in state.items():
-                target_value = current_state.get(key)
-                if target_value is None:
-                    skipped_keys.append(key)
-                    continue
-                if tuple(value.shape) != tuple(target_value.shape):
-                    skipped_keys.append(key)
-                    continue
-                compatible_state[key] = value
-            if not compatible_state:
-                raise RuntimeError(f"V8 head checkpoint has no compatible tensors: {path}") from error
-            load_result = self.module.load_state_dict(compatible_state, strict=False)
-            missing_keys = list(load_result.missing_keys)
-            unexpected_keys = list(load_result.unexpected_keys)
-            print(
-                "V8 object head checkpoint migrated: "
-                f"{path} loaded={len(compatible_state)} "
-                f"missing={len(missing_keys)} skipped={len(skipped_keys)} unexpected={len(unexpected_keys)}",
-                flush=True,
-            )
-            if missing_keys:
-                print(f"  Initialized new V8 head tensors: {', '.join(missing_keys[:12])}", flush=True)
-                if len(missing_keys) > 12:
-                    print(f"  ... plus {len(missing_keys) - 12} more", flush=True)
-            if skipped_keys:
-                print(f"  Skipped incompatible checkpoint tensors: {', '.join(skipped_keys[:12])}", flush=True)
-                if len(skipped_keys) > 12:
-                    print(f"  ... plus {len(skipped_keys) - 12} more", flush=True)
-            if unexpected_keys:
-                print(f"  Unexpected checkpoint tensors: {', '.join(unexpected_keys[:12])}", flush=True)
+        self.module.load_state_dict(state, strict=True)
         self.weights_loaded = True
         self.last_mode = "template_patch_lora_conditioned"
 
@@ -1053,44 +997,6 @@ class V8FeatureIdentityArbitrator(mot.LightweightIdentityArbitrator):
         assignments.sort(key=lambda item: item[0])
         return assignments
 
-    def assignment_gate(
-        self,
-        track: mot.TrackState,
-        output: mot.LoRATSlotOutput,
-        score: mot.IdentityScore,
-    ) -> Tuple[bool, str]:
-        """Apply one identity policy to both Hungarian and fallback assignments."""
-
-        is_view_change = self.is_view_change_candidate(track, output, score)
-        if score.total < self.min_score and not is_view_change:
-            return False, "LOW_IDENTITY_SCORE"
-        if self.track_has_feature_appearance(track) and score.appearance < self.min_reid and not is_view_change:
-            return False, "LOW_REID_SIMILARITY"
-        anchor_conflict = (
-            score.other_track_id is not None
-            and score.occlusion_iou >= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_IOU
-            and score.other_anchor >= mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MIN_OTHER
-            and score.identity_margin <= -mot.DEFAULT_IDENTITY_ANCHOR_STEAL_MARGIN
-        )
-        if anchor_conflict and not is_view_change:
-            return False, "ANCHOR_CONFLICT"
-        ambiguous_anchor = (
-            score.other_track_id is not None
-            and score.other_anchor >= max(0.60, score.initial_anchor + 0.04)
-            and score.identity_margin < -0.03
-            and (score.occlusion_iou >= 0.05 or output.source_track_id != track.track_id)
-        )
-        if ambiguous_anchor and not is_view_change:
-            return False, "AMBIGUOUS_IDENTITY"
-        if output.source_track_id != track.track_id and not is_view_change:
-            if score.appearance < max(self.min_reid, 0.50):
-                return False, "CROSS_SOURCE_LOW_REID"
-            if score.motion < max(self.min_motion, 0.30) and score.path < max(self.min_path, 0.45):
-                return False, "CROSS_SOURCE_GEOMETRY"
-            if score.identity_margin < -0.02:
-                return False, "CROSS_SOURCE_ANCHOR_MARGIN"
-        return True, ""
-
     def feature_similarity(self, left, right) -> float:
         left = self.normalize_feature(left)
         right = self.normalize_feature(right)
@@ -1149,21 +1055,17 @@ class V8FeatureIdentityArbitrator(mot.LightweightIdentityArbitrator):
         score_matrices = self._identity_score_matrices(tracks, outputs)
         self._remember_score_matrices(tracks, outputs, score_matrices)
         score_matrix = score_matrices["total"]
-        gated_score_matrix = np.full_like(score_matrix, -1_000_000.0, dtype=np.float32)
-        score_parts_by_pair: Dict[Tuple[int, int], mot.IdentityScore] = {}
-        for row, track in enumerate(tracks):
-            for col, output in enumerate(outputs):
-                score_parts = self._identity_score_from_matrices(score_matrices, row, col)
-                score_parts_by_pair[(row, col)] = score_parts
-                accepted, _ = self.assignment_gate(track, output, score_parts)
-                if accepted:
-                    gated_score_matrix[row, col] = score_matrix[row, col]
         assignments = []
         assignment_floor = min(self.min_score, self.view_change_min_score)
-        for row, col, score in self._solve_assignment_matrix(gated_score_matrix, assignment_floor):
-            score_parts = score_parts_by_pair[(row, col)]
+        for row, col, score in self._solve_assignment_matrix(score_matrix, assignment_floor):
+            score_parts = self._identity_score_from_matrices(score_matrices, row, col)
             track = tracks[row]
             output = outputs[col]
+            is_view_change = self.is_view_change_candidate(track, output, score_parts)
+            if score_parts.total < self.min_score and not is_view_change:
+                continue
+            if self.track_has_feature_appearance(track) and score_parts.appearance < self.min_reid and not is_view_change:
+                continue
             assignments.append(
                 mot.IdentityAssignment(
                     track=track,
@@ -1332,7 +1234,7 @@ class V8QualityBatchedLoRATTracker:
     the Week 2 property: one shared backbone pass plus one batched per-object head pass.
     """
 
-    backend_name = "LoRAT-v8-quality-batched"
+    backend_name = "LoRAT-v9-open-world"
 
     def __init__(
         self,
@@ -1416,23 +1318,6 @@ class V8QualityBatchedLoRATTracker:
         v8_dinov2_crop_reid: bool = DEFAULT_V8_DINOV2_CROP_REID,
         v8_dinov2_crop_reid_batch: int = DEFAULT_V8_DINOV2_CROP_REID_BATCH,
         v8_dinov2_crop_reid_min_area: float = DEFAULT_V8_DINOV2_CROP_REID_MIN_AREA,
-        v8_assignment_conflict_iou: float = DEFAULT_V8_ASSIGNMENT_CONFLICT_IOU,
-        v8_assignment_conflict_hard_iou: float = DEFAULT_V8_ASSIGNMENT_CONFLICT_HARD_IOU,
-        v8_assignment_conflict_score_margin: float = DEFAULT_V8_ASSIGNMENT_CONFLICT_SCORE_MARGIN,
-        v8_assignment_conflict_center_ratio: float = DEFAULT_V8_ASSIGNMENT_CONFLICT_CENTER_RATIO,
-        v8_assignment_conflict_containment: float = DEFAULT_V8_ASSIGNMENT_CONFLICT_CONTAINMENT,
-        v8_assignment_conflict_ownership_margin: float = DEFAULT_V8_ASSIGNMENT_CONFLICT_OWNERSHIP_MARGIN,
-        v8_assignment_alt_rescue: bool = DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_ENABLED,
-        v8_assignment_alt_rescue_max_candidates: int = DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_MAX_CANDIDATES,
-        v8_assignment_alt_rescue_min_confidence: float = DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_MIN_CONFIDENCE,
-        v8_small_target_mode: bool = DEFAULT_V8_SMALL_TARGET_MODE,
-        v8_small_target_area: float = DEFAULT_V8_SMALL_TARGET_AREA,
-        v8_small_target_max_side: float = DEFAULT_V8_SMALL_TARGET_MAX_SIDE,
-        v8_small_target_max_scale_change: float = DEFAULT_V8_SMALL_TARGET_MAX_SCALE_CHANGE,
-        v8_small_target_template_min_score: float = DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_SCORE,
-        v8_small_target_template_min_motion: float = DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_MOTION,
-        v8_small_target_template_min_path: float = DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_PATH,
-        v8_small_target_confidence_floor: float = DEFAULT_V8_SMALL_TARGET_CONFIDENCE_FLOOR,
     ) -> None:
         self.lorat_root = lorat_root.resolve()
         self.config_name = config_name
@@ -1500,10 +1385,6 @@ class V8QualityBatchedLoRATTracker:
         self.v8_recovery_decisions = 0
         self.v8_selected_head_items = 0
         self.v8_recovery_reason_counts: Counter[str] = Counter()
-        self.v8_assignment_conflict_reason_counts: Counter[str] = Counter()
-        self.v8_assignment_alt_rescue_attempts = 0
-        self.v8_assignment_alt_rescue_hits = 0
-        self.v8_assignment_alt_rescue_reject_counts: Counter[str] = Counter()
         self.score_reduction = score_reduction
         if self.score_reduction not in {"max", "mean"}:
             raise ValueError("--v8-score-reduction must be 'max' or 'mean'.")
@@ -1528,29 +1409,6 @@ class V8QualityBatchedLoRATTracker:
         self.v8_dinov2_crop_reid = bool(v8_dinov2_crop_reid)
         self.v8_dinov2_crop_reid_batch = max(1, int(v8_dinov2_crop_reid_batch))
         self.v8_dinov2_crop_reid_min_area = max(1.0, float(v8_dinov2_crop_reid_min_area))
-        self.v8_assignment_conflict_iou = max(0.0, min(1.0, float(v8_assignment_conflict_iou)))
-        self.v8_assignment_conflict_hard_iou = max(
-            self.v8_assignment_conflict_iou,
-            min(1.0, float(v8_assignment_conflict_hard_iou)),
-        )
-        self.v8_assignment_conflict_score_margin = max(0.0, float(v8_assignment_conflict_score_margin))
-        self.v8_assignment_conflict_center_ratio = max(0.0, float(v8_assignment_conflict_center_ratio))
-        self.v8_assignment_conflict_containment = max(0.0, min(1.0, float(v8_assignment_conflict_containment)))
-        self.v8_assignment_conflict_ownership_margin = float(v8_assignment_conflict_ownership_margin)
-        self.v8_assignment_alt_rescue = bool(v8_assignment_alt_rescue)
-        self.v8_assignment_alt_rescue_max_candidates = max(0, int(v8_assignment_alt_rescue_max_candidates))
-        self.v8_assignment_alt_rescue_min_confidence = max(
-            0.0,
-            min(1.0, float(v8_assignment_alt_rescue_min_confidence)),
-        )
-        self.v8_small_target_mode = bool(v8_small_target_mode)
-        self.v8_small_target_area = max(1.0, float(v8_small_target_area))
-        self.v8_small_target_max_side = max(1.0, float(v8_small_target_max_side))
-        self.v8_small_target_max_scale_change = max(1.0, float(v8_small_target_max_scale_change))
-        self.v8_small_target_template_min_score = max(0.0, min(1.0, float(v8_small_target_template_min_score)))
-        self.v8_small_target_template_min_motion = max(0.0, min(1.0, float(v8_small_target_template_min_motion)))
-        self.v8_small_target_template_min_path = max(0.0, min(1.0, float(v8_small_target_template_min_path)))
-        self.v8_small_target_confidence_floor = max(0.0, min(1.0, float(v8_small_target_confidence_floor)))
         self.v8_template_match_attempts = 0
         self.v8_template_match_hits = 0
         self.v8_template_fused_candidates = 0
@@ -1738,14 +1596,6 @@ class V8QualityBatchedLoRATTracker:
             f"identity arbitration: {self.identity_arbitrator.enabled}; "
             f"DINOv2 crop ReID: {self.v8_dinov2_crop_reid} "
             f"(batch {self.v8_dinov2_crop_reid_batch}); "
-            f"assignment conflict IoU/hard/margin: "
-            f"{self.v8_assignment_conflict_iou:.2f}/{self.v8_assignment_conflict_hard_iou:.2f}/"
-            f"{self.v8_assignment_conflict_score_margin:.2f}; "
-            f"center/contain/own: {self.v8_assignment_conflict_center_ratio:.2f}/"
-            f"{self.v8_assignment_conflict_containment:.2f}/{self.v8_assignment_conflict_ownership_margin:.2f}; "
-            f"alt rescue: {self.v8_assignment_alt_rescue} "
-            f"(max {self.v8_assignment_alt_rescue_max_candidates}, "
-            f"min conf {self.v8_assignment_alt_rescue_min_confidence:.2f}); "
             f"feature template recovery: {self.v8_template_match}"
             f" (uncertain-only after trained head: {self.v8_template_match_on_uncertain_only})."
         )
@@ -2052,318 +1902,6 @@ class V8QualityBatchedLoRATTracker:
                 tracks.append(track)
         return tracks
 
-    @staticmethod
-    def _bbox_overlap_fraction(left: BBox, right: BBox) -> float:
-        """Intersection over the smaller box area, useful for near-containment conflicts."""
-
-        lx, ly, lw, lh = mot.clamp_bbox_size(left)
-        rx, ry, rw, rh = mot.clamp_bbox_size(right)
-        inter_x1 = max(lx, rx)
-        inter_y1 = max(ly, ry)
-        inter_x2 = min(lx + lw, rx + rw)
-        inter_y2 = min(ly + lh, ry + rh)
-        intersection = max(0.0, inter_x2 - inter_x1) * max(0.0, inter_y2 - inter_y1)
-        smaller_area = max(1.0, min(lw * lh, rw * rh))
-        return float(intersection / smaller_area)
-
-    @staticmethod
-    def _bbox_center_ratio(left: BBox, right: BBox) -> float:
-        """Center distance normalized by the smaller box diagonal."""
-
-        left_center = np.asarray(mot.bbox_center(left), dtype=np.float32)
-        right_center = np.asarray(mot.bbox_center(right), dtype=np.float32)
-        distance = float(np.linalg.norm(left_center - right_center))
-        reference = max(1.0, min(mot.bbox_diagonal(left), mot.bbox_diagonal(right)))
-        return float(distance / reference)
-
-    def _assignment_strength(self, track_id: int, assignment: mot.IdentityAssignment) -> Tuple[float, float, float, float, float, float]:
-        confidence = 0.5 if assignment.output.confidence is None else max(0.0, min(1.0, float(assignment.output.confidence)))
-        own_source_bonus = 0.04 if int(assignment.output.source_track_id) == int(track_id) else 0.0
-        return (
-            float(assignment.score.total),
-            float(assignment.score.appearance),
-            float(assignment.score.initial_anchor),
-            float(assignment.score.identity_margin),
-            float(assignment.assignment_margin) + own_source_bonus,
-            confidence,
-        )
-
-    def _assignment_has_strong_ownership(self, track_id: int, assignment: mot.IdentityAssignment) -> bool:
-        if int(assignment.output.source_track_id) != int(track_id):
-            return False
-        return (
-            assignment.score.appearance >= max(self.identity_arbitrator.min_reid + 0.08, 0.52)
-            and assignment.score.initial_anchor >= max(self.v8_accept_min_initial_anchor + 0.04, 0.54)
-            and assignment.score.identity_margin >= self.v8_assignment_conflict_ownership_margin
-            and assignment.assignment_margin >= self.v8_assignment_conflict_score_margin
-            and assignment.score.motion >= max(self.identity_arbitrator.min_motion, 0.24)
-        )
-
-    def _assignment_conflict_reason(
-        self,
-        track_id: int,
-        assignment: mot.IdentityAssignment,
-        kept_track_id: int,
-        kept_assignment: mot.IdentityAssignment,
-    ) -> Optional[str]:
-        overlap_iou = mot.bbox_iou(assignment.output.bbox, kept_assignment.output.bbox)
-        containment = self._bbox_overlap_fraction(assignment.output.bbox, kept_assignment.output.bbox)
-        center_ratio = self._bbox_center_ratio(assignment.output.bbox, kept_assignment.output.bbox)
-        same_output_source = assignment.output.source_track_id == kept_assignment.output.source_track_id
-        soft_overlap = self.v8_assignment_conflict_iou > 0.0 and overlap_iou >= self.v8_assignment_conflict_iou
-        hard_overlap = self.v8_assignment_conflict_hard_iou > 0.0 and overlap_iou >= self.v8_assignment_conflict_hard_iou
-        hard_containment = (
-            self.v8_assignment_conflict_containment > 0.0
-            and containment >= self.v8_assignment_conflict_containment
-        )
-        near_same_center = (
-            self.v8_assignment_conflict_center_ratio > 0.0
-            and center_ratio <= self.v8_assignment_conflict_center_ratio
-            and (overlap_iou >= 0.08 or containment >= 0.22)
-        )
-        anchor_owned_by_kept = (
-            assignment.score.other_track_id == kept_track_id
-            and assignment.score.identity_margin <= -self.v8_assignment_conflict_score_margin
-        )
-        if not (
-            same_output_source
-            or soft_overlap
-            or hard_overlap
-            or hard_containment
-            or near_same_center
-            or anchor_owned_by_kept
-        ):
-            return None
-
-        if (
-            self._assignment_has_strong_ownership(track_id, assignment)
-            and not same_output_source
-            and not hard_overlap
-            and not anchor_owned_by_kept
-        ):
-            return None
-
-        kept_strength = self._assignment_strength(kept_track_id, kept_assignment)
-        candidate_strength = self._assignment_strength(track_id, assignment)
-        total_gap = float(kept_assignment.score.total) - float(assignment.score.total)
-        appearance_gap = float(kept_assignment.score.appearance) - float(assignment.score.appearance)
-        margin_gap = float(kept_assignment.assignment_margin) - float(assignment.assignment_margin)
-        candidate_weak = (
-            int(assignment.output.source_track_id) != int(track_id)
-            or assignment.score.identity_margin < self.v8_assignment_conflict_ownership_margin
-            or assignment.assignment_margin < self.v8_assignment_conflict_score_margin
-            or assignment.score.initial_anchor < self.v8_accept_min_initial_anchor
-            or assignment.score.appearance < max(self.identity_arbitrator.min_reid, 0.42)
-        )
-        kept_not_weaker = kept_strength >= candidate_strength
-        if same_output_source:
-            reason = "SAME_SOURCE"
-        elif hard_overlap:
-            reason = "HARD_IOU"
-        elif soft_overlap:
-            reason = "SOFT_IOU"
-        elif hard_containment:
-            reason = "CONTAINMENT"
-        elif anchor_owned_by_kept:
-            reason = "ANCHOR_OWNER"
-        else:
-            reason = "NEAR_CENTER"
-        if (
-            same_output_source
-            or hard_overlap
-            or anchor_owned_by_kept
-            or (soft_overlap and kept_not_weaker and candidate_weak)
-            or (kept_not_weaker and candidate_weak)
-            or total_gap >= -self.v8_assignment_conflict_score_margin
-            or appearance_gap >= self.v8_assignment_conflict_score_margin
-            or margin_gap >= self.v8_assignment_conflict_score_margin
-        ):
-            return (
-                f"ASSIGNMENT_CONFLICT_{reason}_T{kept_track_id}"
-                f"_IOU{overlap_iou:.2f}_CTR{center_ratio:.2f}_OWN{assignment.score.identity_margin:.2f}"
-        )
-        return None
-
-    @staticmethod
-    def _alternate_candidate_margin(
-        candidate: V8HeadCandidate,
-        candidates: Sequence[V8HeadCandidate],
-    ) -> float:
-        competing = [
-            float(other.confidence)
-            for other in candidates
-            if int(other.rank) != int(candidate.rank)
-        ]
-        return max(0.0, float(candidate.confidence) - (max(competing) if competing else 0.0))
-
-    def _try_rescue_assignment_with_alternate_candidate(
-        self,
-        track_id: int,
-        kept_assignments: Sequence[Tuple[int, mot.IdentityAssignment]],
-        source_record: Dict[str, object],
-        tracks: Sequence[mot.TrackState],
-        frame: np.ndarray,
-        feature_map,
-        frame_shape: Tuple[int, ...],
-    ) -> Optional[Tuple[mot.IdentityAssignment, Dict[str, object]]]:
-        if (
-            not self.v8_assignment_alt_rescue
-            or self.v8_assignment_alt_rescue_max_candidates <= 0
-            or not self.identity_arbitrator.enabled
-        ):
-            return None
-
-        track = self.track_by_id.get(track_id)
-        if track is None:
-            return None
-
-        top_candidates = tuple(source_record.get("head_top_candidates") or ())
-        if len(top_candidates) <= 1:
-            self.v8_assignment_alt_rescue_reject_counts["NO_ALT"] += 1
-            return None
-
-        already_used_bbox = source_record.get("candidate")
-        tried = 0
-        for candidate in top_candidates:
-            if tried >= self.v8_assignment_alt_rescue_max_candidates:
-                break
-            bbox = mot.clamp_bbox_size(candidate.bbox)
-            if already_used_bbox is not None and mot.bbox_iou(bbox, already_used_bbox) >= 0.92:
-                continue
-            confidence = float(candidate.confidence)
-            if confidence < max(self.v8_assignment_alt_rescue_min_confidence, self.lorat_accept_min_score * 0.75):
-                self.v8_assignment_alt_rescue_reject_counts["ALT_LOWCONF"] += 1
-                continue
-            tried += 1
-
-            frame_number = int(getattr(source_record.get("slot"), "frame_number", 0) or 0)
-            slot = self._synthetic_head_slot(track, frame_number)
-            output = mot.LoRATSlotOutput(
-                source_track_id=track_id,
-                slot=slot,
-                bbox=bbox,
-                confidence=confidence,
-            )
-            output = self._with_feature_appearance(output, feature_map, frame_shape)
-            if self.v8_dinov2_crop_reid:
-                self._attach_dinov2_crop_reid_features(frame, [output])
-
-            score = self.identity_arbitrator.score(track, output, tracks)
-            assignment_margin = self._alternate_candidate_margin(candidate, top_candidates)
-            assignment = mot.IdentityAssignment(
-                track=track,
-                output=output,
-                score=score,
-                assignment_margin=assignment_margin,
-            )
-            assignment_ok, reject_state = self.identity_arbitrator.assignment_gate(track, output, score)
-            if not assignment_ok:
-                self.v8_assignment_alt_rescue_reject_counts[f"GATE_{reject_state}"] += 1
-                continue
-            candidate_reject = self._candidate_reject_state(
-                track,
-                bbox,
-                confidence,
-                assignment,
-                f"head_alt_r{candidate.rank}",
-            )
-            if candidate_reject is not None:
-                self.v8_assignment_alt_rescue_reject_counts[f"ACCEPT_{candidate_reject}"] += 1
-                continue
-
-            conflict_reason = None
-            for kept_track_id, kept_assignment in kept_assignments:
-                conflict_reason = self._assignment_conflict_reason(track_id, assignment, kept_track_id, kept_assignment)
-                if conflict_reason is not None:
-                    break
-            if conflict_reason is not None:
-                self.v8_assignment_alt_rescue_reject_counts["ALT_CONFLICT"] += 1
-                continue
-
-            rescued_record = dict(source_record)
-            rescued_record.update(
-                {
-                    "head_candidate": bbox,
-                    "candidate": bbox,
-                    "confidence": confidence,
-                    "margin": assignment_margin,
-                    "candidate_source": f"head_alt_r{candidate.rank}",
-                    "output": output,
-                }
-            )
-            return assignment, rescued_record
-
-        if tried <= 0:
-            self.v8_assignment_alt_rescue_reject_counts["NO_USABLE_ALT"] += 1
-        return None
-
-    def _resolve_assignment_spatial_conflicts(
-        self,
-        assignment_by_track_id: Dict[int, mot.IdentityAssignment],
-        source_record_by_track_id: Dict[int, Dict[str, object]],
-        assignment_reject_by_track_id: Dict[int, str],
-        tracks: Sequence[mot.TrackState],
-        frame: np.ndarray,
-        feature_map,
-        frame_shape: Tuple[int, ...],
-    ) -> None:
-        if (
-            not self.identity_arbitrator.enabled
-            or len(assignment_by_track_id) <= 1
-        ):
-            return
-        if (
-            self.v8_assignment_conflict_iou <= 0.0
-            and self.v8_assignment_conflict_hard_iou <= 0.0
-            and self.v8_assignment_conflict_containment <= 0.0
-            and self.v8_assignment_conflict_center_ratio <= 0.0
-        ):
-            return
-
-        kept_assignments: List[Tuple[int, mot.IdentityAssignment]] = []
-        ordered_assignments = sorted(
-            assignment_by_track_id.items(),
-            key=lambda item: self._assignment_strength(item[0], item[1]),
-            reverse=True,
-        )
-        for track_id, assignment in ordered_assignments:
-            conflict_reason: Optional[str] = None
-            for kept_track_id, kept_assignment in kept_assignments:
-                conflict_reason = self._assignment_conflict_reason(track_id, assignment, kept_track_id, kept_assignment)
-                if conflict_reason is not None:
-                    break
-            if conflict_reason is None:
-                kept_assignments.append((track_id, assignment))
-                continue
-            source_record = source_record_by_track_id.get(track_id)
-            rescued = None
-            if (
-                source_record is not None
-                and self.v8_assignment_alt_rescue
-                and self.v8_assignment_alt_rescue_max_candidates > 0
-            ):
-                self.v8_assignment_alt_rescue_attempts += 1
-                rescued = self._try_rescue_assignment_with_alternate_candidate(
-                    track_id,
-                    kept_assignments,
-                    source_record,
-                    tracks,
-                    frame,
-                    feature_map,
-                    frame_shape,
-                )
-            if rescued is not None:
-                rescued_assignment, rescued_record = rescued
-                assignment_by_track_id[track_id] = rescued_assignment
-                source_record_by_track_id[track_id] = rescued_record
-                kept_assignments.append((track_id, rescued_assignment))
-                self.v8_assignment_alt_rescue_hits += 1
-                continue
-            assignment_by_track_id.pop(track_id, None)
-            source_record_by_track_id.pop(track_id, None)
-            assignment_reject_by_track_id[track_id] = conflict_reason
-            self.v8_assignment_conflict_reason_counts[conflict_reason.split("_T", 1)[0]] += 1
-
     def _score_and_update_tracks(
         self,
         frame: np.ndarray,
@@ -2493,8 +2031,6 @@ class V8QualityBatchedLoRATTracker:
             (assignment.output.source_track_id, assignment.output.slot.task_id)
             for assignment in assignments
         }
-        assignment_reject_by_track_id: Dict[int, str] = {}
-        source_record_by_track_id: Dict[int, Dict[str, object]] = {}
 
         for track in tracks:
             identity_assignment = assignment_by_track_id.get(track.track_id)
@@ -2515,51 +2051,21 @@ class V8QualityBatchedLoRATTracker:
                         output,  # type: ignore[arg-type]
                     )
                     self._add_profile_seconds("identity_score", time.perf_counter() - score_started)
-                    assignment_ok, reject_state = self.identity_arbitrator.assignment_gate(
-                        track,
-                        output,  # type: ignore[arg-type]
-                        score,
+                    identity_assignment = mot.IdentityAssignment(
+                        track=track,
+                        output=output,  # type: ignore[arg-type]
+                        score=score,
+                        assignment_margin=float(source_record["margin"]),
                     )
-                    if assignment_ok:
-                        identity_assignment = mot.IdentityAssignment(
-                            track=track,
-                            output=output,  # type: ignore[arg-type]
-                            score=score,
-                            assignment_margin=float(source_record["margin"]),
-                        )
-                    else:
-                        assignment_reject_by_track_id[track.track_id] = reject_state
-                else:
-                    source_record = None
-            if source_record is not None and identity_assignment is not None:
-                assignment_by_track_id[track.track_id] = identity_assignment
-                source_record_by_track_id[track.track_id] = source_record
-            elif track.track_id not in assignment_reject_by_track_id:
-                assignment_by_track_id.pop(track.track_id, None)
-                assignment_reject_by_track_id[track.track_id] = "NO_ASSIGNMENT"
 
-        self._resolve_assignment_spatial_conflicts(
-            assignment_by_track_id,
-            source_record_by_track_id,
-            assignment_reject_by_track_id,
-            tracks,
-            frame,
-            feature_map,
-            frame.shape,
-        )
-
-        for track in tracks:
-            identity_assignment = assignment_by_track_id.get(track.track_id)
-            source_record = source_record_by_track_id.get(track.track_id)
             own_record = records.get(track.track_id)
             hold_predicted = own_record["predicted"] if own_record is not None else track.predicted_bbox or track.bbox
             hold_confidence = float(own_record["confidence"]) if own_record is not None else 0.0
             hold_margin = float(own_record["margin"]) if own_record is not None else 0.0
             diagnostic = diagnostics_by_track_id.get(track.track_id)
             if source_record is None or identity_assignment is None:
-                reject_state = assignment_reject_by_track_id.get(track.track_id, "NO_ASSIGNMENT")
                 hold_started = time.perf_counter()
-                self._hold_track(track, hold_predicted, hold_confidence, hold_margin, frame_number, frame, reject_state)
+                self._hold_track(track, hold_predicted, hold_confidence, hold_margin, frame_number, frame, "NO_ASSIGNMENT")
                 self._add_profile_seconds("hold", time.perf_counter() - hold_started)
                 if diagnostic is not None:
                     diagnostic.update(
@@ -2569,7 +2075,7 @@ class V8QualityBatchedLoRATTracker:
                             "assigned_confidence": None,
                             "assignment_score": None,
                             "assignment_margin": None,
-                            "reject_state": reject_state,
+                            "reject_state": "NO_ASSIGNMENT",
                             "accepted": False,
                             "held": True,
                             "final_bbox": track.bbox,
@@ -2827,54 +2333,6 @@ class V8QualityBatchedLoRATTracker:
         widths = np.asarray([max(1.0, float(sample[2])) for sample in samples], dtype=np.float32)
         heights = np.asarray([max(1.0, float(sample[3])) for sample in samples], dtype=np.float32)
         return max(1.0, float(np.median(widths))), max(1.0, float(np.median(heights)))
-
-    def _is_small_target_track(self, track: mot.TrackState) -> bool:
-        if not self.v8_small_target_mode:
-            return False
-        reference = track.initial_bbox or track.last_reliable_bbox or track.bbox
-        _, _, width, height = mot.clamp_bbox_size(reference)
-        return (width * height) <= self.v8_small_target_area or max(width, height) <= self.v8_small_target_max_side
-
-    def _small_target_reference_size(self, track: mot.TrackState) -> Tuple[float, float]:
-        if track.initial_bbox is not None:
-            _, _, width, height = mot.clamp_bbox_size(track.initial_bbox)
-            return max(1.0, width), max(1.0, height)
-        return self._head_decode_reference_size(track)
-
-    def _template_match_reference_size(self, track: mot.TrackState) -> Tuple[float, float]:
-        if self._is_small_target_track(track):
-            return self._small_target_reference_size(track)
-        return self._head_decode_reference_size(track)
-
-    def _small_target_scale_error(self, track: mot.TrackState, bbox: BBox) -> float:
-        if not self._is_small_target_track(track):
-            return 1.0
-        _, _, width, height = mot.clamp_bbox_size(bbox)
-        reference_w, reference_h = self._small_target_reference_size(track)
-        return max(
-            width / max(1.0, reference_w),
-            reference_w / max(1.0, width),
-            height / max(1.0, reference_h),
-            reference_h / max(1.0, height),
-        )
-
-    def _apply_small_target_scale_lock(self, track: mot.TrackState, bbox: BBox, frame: Optional[np.ndarray]) -> Tuple[BBox, bool]:
-        if not self._is_small_target_track(track):
-            return mot.clamp_bbox_to_frame_bounds(frame, bbox), False
-        x, y, width, height = mot.clamp_bbox_size(bbox)
-        reference_w, reference_h = self._small_target_reference_size(track)
-        center_x, center_y = mot.bbox_center((x, y, width, height))
-        locked = mot.clamp_bbox_to_frame_bounds(
-            frame,
-            (
-                center_x - (reference_w / 2.0),
-                center_y - (reference_h / 2.0),
-                reference_w,
-                reference_h,
-            ),
-        )
-        changed = abs(locked[2] - width) > 0.01 or abs(locked[3] - height) > 0.01
-        return locked, changed
 
     def _candidates_from_head_output(
         self,
@@ -3213,19 +2671,6 @@ class V8QualityBatchedLoRATTracker:
             return "TEMPLATE_HOLD"
         confidence_floor = max(self.min_confidence, self.lorat_accept_min_score)
         if confidence < confidence_floor:
-            if (
-                self._is_small_target_track(track)
-                and "template" in str(candidate_source)
-                and confidence >= self.v8_small_target_confidence_floor
-                and identity_assignment is not None
-            ):
-                score = identity_assignment.score
-                if (
-                    score.initial_anchor >= max(0.70, self.v8_accept_min_initial_anchor)
-                    and score.appearance >= max(0.55, self.identity_arbitrator.min_reid if self.identity_arbitrator else 0.0)
-                    and score.motion >= self.v8_small_target_template_min_motion
-                ):
-                    return None
             if self._is_reid_recovery(track, confidence, identity_assignment):
                 return None
             return "LOWCONF"
@@ -3478,9 +2923,6 @@ class V8QualityBatchedLoRATTracker:
         limited, size_floor_applied = self._apply_trusted_size_floor(track, limited, frame)
         if size_floor_applied:
             tokens.append("SIZEFLOOR")
-        limited, small_lock_applied = self._apply_small_target_scale_lock(track, limited, frame)
-        if small_lock_applied:
-            tokens.append("SMALLLOCK")
         return limited, tokens
 
     def _candidate_occlusion_info(self, track: mot.TrackState, bbox: BBox) -> Tuple[Optional[int], float]:
@@ -3730,15 +3172,8 @@ class V8QualityBatchedLoRATTracker:
         track.occlusion_iou = None
         if track.kalman is not None:
             track.kalman.state[4:] *= self.occlusion_velocity_damping
-        conflict_suppressed = str(hold_reason or "").startswith("ASSIGNMENT_CONFLICT")
-        if conflict_suppressed:
-            track.ok = False
-            track.assigned_source = "v8-conflict-suppressed-hold"
-        else:
-            track.ok = self.occlusion_max_frames > 0 and track.lost_frames <= self.occlusion_max_frames
+        track.ok = self.occlusion_max_frames > 0 and track.lost_frames <= self.occlusion_max_frames
         state = mot.append_state_token("V8HEAD_MISS", "OCCLUDED") if track.ok else mot.append_state_token("V8HEAD_MISS", "LOST")
-        if conflict_suppressed:
-            state = mot.append_state_token(state, "CONFLICT_SUPPRESSED")
         if hold_reason:
             state = mot.append_state_token(state, hold_reason)
         track.state = state
@@ -4052,7 +3487,7 @@ class V8QualityBatchedLoRATTracker:
         if not bank:
             return None, 0.0
 
-        reference_w, reference_h = self._template_match_reference_size(track)
+        reference_w, reference_h = self._head_decode_reference_size(track)
         roi = self._expanded_search_bbox(predicted, track.bbox, (reference_w, reference_h))
         y_slice, x_slice = self._bbox_to_grid_slices(roi, frame_shape)
         roi_features = feature_map[y_slice, x_slice]
@@ -4094,12 +3529,7 @@ class V8QualityBatchedLoRATTracker:
             margin = 0.0
 
         confidence = max(0.0, min(1.0, (float(best_value.detach().to(device="cpu", dtype=self.torch.float32).item()) + 1.0) * 0.5))
-        min_template_score = (
-            self.v8_small_target_template_min_score
-            if self._is_small_target_track(track)
-            else self.v8_template_match_min_score
-        )
-        if confidence < min_template_score:
+        if confidence < self.v8_template_match_min_score:
             return None, confidence
 
         local_index = int(best_index.detach().to(device="cpu").item())
@@ -4151,10 +3581,6 @@ class V8QualityBatchedLoRATTracker:
         template_confidence: float,
     ) -> Tuple[BBox, float, float, str]:
         if template_candidate is None:
-            if self._is_small_target_track(track):
-                locked, changed = self._apply_small_target_scale_lock(track, head_candidate, frame)
-                if changed:
-                    return locked, head_confidence, head_margin, "head-smallscale"
             return head_candidate, head_confidence, head_margin, "head"
         self.v8_template_match_hits += 1
 
@@ -4166,23 +3592,6 @@ class V8QualityBatchedLoRATTracker:
         template_path = mot.center_path_affinity(track, template_candidate)
         head_template_iou = mot.bbox_iou(head_candidate, template_candidate)
         head_is_uncertain = head_confidence < self.min_confidence or head_margin < self.v8_template_match_margin_gate
-        small_target = self._is_small_target_track(track)
-        head_scale_bad = small_target and self._small_target_scale_error(track, head_candidate) > self.v8_small_target_max_scale_change
-        if small_target:
-            small_template_is_strong = (
-                template_confidence >= self.v8_small_target_template_min_score
-                and template_motion >= self.v8_small_target_template_min_motion
-                and template_path >= self.v8_small_target_template_min_path
-            )
-            if small_template_is_strong and (head_is_uncertain or head_scale_bad or track.lost_frames > 0):
-                self.v8_template_preferred_candidates += 1
-                locked_template, _ = self._apply_small_target_scale_lock(track, template_candidate, frame)
-                return (
-                    locked_template,
-                    max(head_confidence, template_confidence),
-                    max(head_margin, template_confidence - head_confidence),
-                    "small-template",
-                )
         template_is_strong = (
             template_confidence >= max(self.v8_template_match_min_score, head_confidence + self.v8_template_match_prefer_margin)
             and template_motion >= DEFAULT_V8_TEMPLATE_RESCUE_MIN_MOTION
@@ -4207,10 +3616,6 @@ class V8QualityBatchedLoRATTracker:
             and template_path >= max(0.45, head_path - 0.05)
         )
         if not can_blend_template:
-            if small_target:
-                locked, changed = self._apply_small_target_scale_lock(track, head_candidate, frame)
-                if changed:
-                    return locked, head_confidence, head_margin, "head-smallscale"
             return head_candidate, head_confidence, head_margin, "head"
         self.v8_template_fused_candidates += 1
         fused = self._blend_bboxes(head_candidate, template_candidate, self.v8_head_template_blend, frame)
@@ -4455,30 +3860,6 @@ class V8QualityBatchedLoRATTracker:
                 f"{status.crop_reid_forward_items} crops | "
                 f"max batch {status.max_crop_reid_batch}"
             ),
-            (
-                "assignment conflicts "
-                + (
-                    ", ".join(
-                        f"{reason}:{count}"
-                        for reason, count in sorted(self.v8_assignment_conflict_reason_counts.items())
-                    )
-                    if self.v8_assignment_conflict_reason_counts
-                    else "0"
-                )
-            ),
-            (
-                "assignment alt rescue "
-                f"{self.v8_assignment_alt_rescue_hits}/{self.v8_assignment_alt_rescue_attempts} hits"
-                + (
-                    " | rejects "
-                    + ", ".join(
-                        f"{reason}:{count}"
-                        for reason, count in sorted(self.v8_assignment_alt_rescue_reject_counts.items())
-                    )
-                    if self.v8_assignment_alt_rescue_reject_counts
-                    else ""
-                )
-            ),
         ]
         if status.gpu_name:
             gpu = f"GPU {status.gpu_name}"
@@ -4504,17 +3885,6 @@ class V8QualityBatchedLoRATTracker:
         status.gating_recovery_reasons = ",".join(
             f"{reason}:{count}"
             for reason, count in sorted(self.v8_recovery_reason_counts.items())
-        )
-        status.v8_assignment_conflict_rejections = sum(self.v8_assignment_conflict_reason_counts.values())
-        status.v8_assignment_conflict_reasons = ",".join(
-            f"{reason}:{count}"
-            for reason, count in sorted(self.v8_assignment_conflict_reason_counts.items())
-        )
-        status.v8_assignment_alt_rescue_attempts = self.v8_assignment_alt_rescue_attempts
-        status.v8_assignment_alt_rescue_hits = self.v8_assignment_alt_rescue_hits
-        status.v8_assignment_alt_rescue_rejects = ",".join(
-            f"{reason}:{count}"
-            for reason, count in sorted(self.v8_assignment_alt_rescue_reject_counts.items())
         )
         status.v8_template_match_attempts = self.v8_template_match_attempts
         status.v8_template_match_hits = self.v8_template_match_hits
@@ -4555,8 +3925,8 @@ def parse_initial_boxes(value: Optional[str]) -> List[BBox]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Version 8 LoRAT-backed multi-object tracker with one shared frame ViT pass "
-            "and batched per-object low-rank heads."
+            "Version 9 LoRAT-backed open-world tracker: V8 quality tracker plus "
+            "class-agnostic proposal queue for Week 4 object discovery."
         )
     )
     parser.add_argument("--video", help="Path to a video file or camera index. Use 0 for webcam.")
@@ -4737,60 +4107,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--v8-dinov2-crop-reid-batch", type=int, default=DEFAULT_V8_DINOV2_CROP_REID_BATCH)
     parser.add_argument("--v8-dinov2-crop-reid-min-area", type=float, default=DEFAULT_V8_DINOV2_CROP_REID_MIN_AREA)
-    parser.add_argument("--v8-assignment-conflict-iou", type=float, default=DEFAULT_V8_ASSIGNMENT_CONFLICT_IOU)
-    parser.add_argument("--v8-assignment-conflict-hard-iou", type=float, default=DEFAULT_V8_ASSIGNMENT_CONFLICT_HARD_IOU)
-    parser.add_argument("--v8-assignment-conflict-score-margin", type=float, default=DEFAULT_V8_ASSIGNMENT_CONFLICT_SCORE_MARGIN)
-    parser.add_argument(
-        "--v8-assignment-conflict-center-ratio",
-        type=float,
-        default=DEFAULT_V8_ASSIGNMENT_CONFLICT_CENTER_RATIO,
-        help="Reject weaker assignments whose boxes have centers this close, measured as center distance / smaller box diagonal.",
-    )
-    parser.add_argument(
-        "--v8-assignment-conflict-containment",
-        type=float,
-        default=DEFAULT_V8_ASSIGNMENT_CONFLICT_CONTAINMENT,
-        help="Reject weaker assignments when candidate boxes overlap by at least this fraction of the smaller box area.",
-    )
-    parser.add_argument(
-        "--v8-assignment-conflict-ownership-margin",
-        type=float,
-        default=DEFAULT_V8_ASSIGNMENT_CONFLICT_OWNERSHIP_MARGIN,
-        help="Minimum initial-anchor margin needed to protect a same-source track from spatial conflict suppression.",
-    )
-    parser.add_argument(
-        "--disable-v8-assignment-alt-rescue",
-        dest="v8_assignment_alt_rescue",
-        action="store_false",
-        default=DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_ENABLED,
-        help="Disable trying a conflicted track's next-best V8 head candidates before holding it.",
-    )
-    parser.add_argument(
-        "--v8-assignment-alt-rescue-max-candidates",
-        type=int,
-        default=DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_MAX_CANDIDATES,
-        help="Maximum top-k head alternatives to test when a track loses spatial assignment arbitration.",
-    )
-    parser.add_argument(
-        "--v8-assignment-alt-rescue-min-confidence",
-        type=float,
-        default=DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_MIN_CONFIDENCE,
-        help="Minimum head confidence for alternate candidates used to rescue spatial assignment conflicts.",
-    )
-    parser.add_argument(
-        "--disable-v8-small-target-mode",
-        dest="v8_small_target_mode",
-        action="store_false",
-        default=DEFAULT_V8_SMALL_TARGET_MODE,
-        help="Disable selected-small-target scale lock and template rescue.",
-    )
-    parser.add_argument("--v8-small-target-area", type=float, default=DEFAULT_V8_SMALL_TARGET_AREA)
-    parser.add_argument("--v8-small-target-max-side", type=float, default=DEFAULT_V8_SMALL_TARGET_MAX_SIDE)
-    parser.add_argument("--v8-small-target-max-scale-change", type=float, default=DEFAULT_V8_SMALL_TARGET_MAX_SCALE_CHANGE)
-    parser.add_argument("--v8-small-target-template-min-score", type=float, default=DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_SCORE)
-    parser.add_argument("--v8-small-target-template-min-motion", type=float, default=DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_MOTION)
-    parser.add_argument("--v8-small-target-template-min-path", type=float, default=DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_PATH)
-    parser.add_argument("--v8-small-target-confidence-floor", type=float, default=DEFAULT_V8_SMALL_TARGET_CONFIDENCE_FLOOR)
     parser.add_argument("--output", type=Path, help="MOTChallenge-format result file.")
     parser.add_argument("--save-video", type=Path, help="Annotated MP4 output path.")
     parser.add_argument("--no-save-video", action="store_true", help="Disable annotated MP4 writing.")
@@ -4801,10 +4117,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-week2-proof-log", action="store_true", help="Compatibility no-op; proof logging is disabled unless --week2-proof-log is set or a benchmark enables it.")
     parser.add_argument("--manual-event-log", type=Path, help="Human-cost event CSV for manual reanchors.")
     parser.add_argument("--no-manual-event-log", action="store_true", help="Disable manual reanchor event CSV writing.")
+    parser.add_argument(
+        "--enable-proposals",
+        action="store_true",
+        help="Enable Week 4 class-agnostic object proposals and proposal accept/reject UI.",
+    )
+    parser.add_argument(
+        "--proposal-source",
+        choices=("auto", "selective_search", "contour"),
+        default="auto",
+        help="Class-agnostic proposal source. auto uses selective search when available, then contours.",
+    )
+    parser.add_argument("--proposal-log", type=Path, help="Proposal queue event CSV.")
+    parser.add_argument("--no-proposal-log", action="store_true", help="Disable proposal queue event CSV writing.")
+    parser.add_argument("--proposal-interval", type=int, default=5, help="Generate new proposals every N frames.")
+    parser.add_argument("--max-proposals-per-frame", type=int, default=12, help="Maximum new object proposals per proposal frame.")
+    parser.add_argument("--max-pending-proposals", type=int, default=64, help="Maximum pending proposal queue length.")
+    parser.add_argument("--proposal-min-area", type=float, default=256.0, help="Minimum proposal area in pixels.")
+    parser.add_argument("--proposal-iou-suppression", type=float, default=0.70, help="NMS/duplicate IoU threshold for proposals.")
     parser.add_argument("--debug-frame-start", type=int, default=0, help="First frame to include in --debug-log; 0 means all.")
     parser.add_argument("--debug-frame-end", type=int, default=0, help="Last frame to include in --debug-log; 0 means all.")
     parser.add_argument("--max-frames", type=int, default=0, help="Optional frame limit for smoke tests.")
-    parser.add_argument("--no-display", action="store_true", help="Run without cv2.imshow; requires --initial-boxes.")
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Run without cv2.imshow; requires --initial-boxes unless --enable-proposals is used.",
+    )
     return parser.parse_args()
 
 
@@ -4891,42 +4229,30 @@ def create_backend(args: argparse.Namespace, source: mot.FrameSource, expected_t
         args.v8_dinov2_crop_reid,
         args.v8_dinov2_crop_reid_batch,
         args.v8_dinov2_crop_reid_min_area,
-        args.v8_assignment_conflict_iou,
-        args.v8_assignment_conflict_hard_iou,
-        args.v8_assignment_conflict_score_margin,
-        args.v8_assignment_conflict_center_ratio,
-        args.v8_assignment_conflict_containment,
-        args.v8_assignment_conflict_ownership_margin,
-        args.v8_assignment_alt_rescue,
-        args.v8_assignment_alt_rescue_max_candidates,
-        args.v8_assignment_alt_rescue_min_confidence,
-        args.v8_small_target_mode,
-        args.v8_small_target_area,
-        args.v8_small_target_max_side,
-        args.v8_small_target_max_scale_change,
-        args.v8_small_target_template_min_score,
-        args.v8_small_target_template_min_motion,
-        args.v8_small_target_template_min_path,
-        args.v8_small_target_confidence_floor,
     )
 
 
 def default_output_path(source_name: str) -> Path:
-    return mot.default_output_path(source_name, "lorat_v8")
+    return mot.default_output_path(source_name, "lorat_v9")
 
 
 def default_debug_log_path(source_name: str) -> Path:
-    return mot.default_debug_log_path(source_name, "lorat_v8")
+    return mot.default_debug_log_path(source_name, "lorat_v9")
 
 
 def default_week2_proof_log_path(source_name: str) -> Path:
     safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in source_name)
-    return mot.DEFAULT_DEBUG_DIR / f"{safe_name}_lorat_v8_week2_proof.csv"
+    return mot.DEFAULT_DEBUG_DIR / f"{safe_name}_lorat_v9_week2_proof.csv"
 
 
 def default_manual_event_log_path(source_name: str) -> Path:
     safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in source_name)
-    return mot.DEFAULT_DEBUG_DIR / f"{safe_name}_lorat_v8_manual_events.csv"
+    return mot.DEFAULT_DEBUG_DIR / f"{safe_name}_lorat_v9_manual_events.csv"
+
+
+def default_proposal_log_path(source_name: str) -> Path:
+    safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in source_name)
+    return mot.DEFAULT_DEBUG_DIR / f"{safe_name}_lorat_v9_proposals.csv"
 
 
 def write_week2_proof_log(path: Path, lines: Sequence[str]) -> None:
@@ -4994,7 +4320,7 @@ def write_v8_debug_log(path: Path, lines: Sequence[str]) -> None:
 
 
 def default_video_path(source_name: str) -> Path:
-    return mot.default_video_path(source_name, "lorat_v8")
+    return mot.default_video_path(source_name, "lorat_v9")
 
 
 def main() -> int:
@@ -5005,6 +4331,7 @@ def main() -> int:
     slot_debug_log_path = None if args.no_slot_debug_log else args.slot_debug_log
     week2_proof_log_path = None if args.no_week2_proof_log else args.week2_proof_log
     manual_event_log_path = None if args.no_manual_event_log else (args.manual_event_log or default_manual_event_log_path(frame_source.name))
+    proposal_log_path = None if args.no_proposal_log else (args.proposal_log or default_proposal_log_path(frame_source.name))
     save_video_path = None if args.no_save_video else (args.save_video or default_video_path(frame_source.name))
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -5014,11 +4341,11 @@ def main() -> int:
         return 1
 
     boxes = parse_initial_boxes(args.initial_boxes)
-    if not boxes and args.no_display:
+    if not boxes and args.no_display and not args.enable_proposals:
         raise RuntimeError("--no-display requires --initial-boxes.")
-    if not boxes:
+    if not boxes and not args.enable_proposals:
         boxes = mot.select_boxes(first_frame)
-    if not boxes:
+    if not boxes and not args.enable_proposals:
         print("No bounding boxes selected. Exiting.")
         frame_source.release()
         cv2.destroyAllWindows()
@@ -5029,10 +4356,47 @@ def main() -> int:
     mot_lines: List[str] = []
     debug_lines: List[str] = []
     manual_events: List[mot.ManualReanchorEvent] = []
+    proposal_queue = mot.ProposalQueue(args.max_pending_proposals, args.proposal_iou_suppression)
     frame_number = 1
     paused = False
     outputs_written = False
     last_frame = first_frame
+
+    def update_proposals(frame: np.ndarray, current_frame: int) -> None:
+        if not args.enable_proposals:
+            return
+        interval = max(1, int(args.proposal_interval))
+        if current_frame % interval != 0:
+            return
+        proposals = mot.generate_class_agnostic_proposals(
+            frame,
+            source=args.proposal_source,
+            max_proposals=args.max_proposals_per_frame,
+            min_area=args.proposal_min_area,
+            nms_iou=args.proposal_iou_suppression,
+        )
+        proposal_queue.add_frame_proposals(current_frame, proposals)
+
+    def status_lines() -> List[str]:
+        lines = list(backend.status_lines())
+        if args.enable_proposals:
+            current = proposal_queue.current()
+            current_text = "none" if current is None else f"P{current.proposal_id} {current.score:.2f}"
+            lines.append(
+                f"Proposals pending {len(proposal_queue)} | current {current_text} | y accept | x reject | [/] cycle"
+            )
+        return lines
+
+    def draw_frame(frame: np.ndarray) -> np.ndarray:
+        shown = mot.draw_tracks(frame, backend.tracks, frame_number, backend.backend_name, status_lines())
+        if args.enable_proposals:
+            current = proposal_queue.current()
+            shown = mot.draw_proposals(
+                shown,
+                proposal_queue.pending,
+                active_proposal_id=None if current is None else current.proposal_id,
+            )
+        return shown
 
     def flush_outputs() -> None:
         nonlocal outputs_written
@@ -5051,14 +4415,18 @@ def main() -> int:
         if manual_event_log_path is not None:
             mot.write_manual_event_csv(manual_event_log_path, manual_events)
             print(f"Wrote manual event CSV to: {manual_event_log_path}")
+        if args.enable_proposals and proposal_log_path is not None:
+            mot.write_proposal_event_csv(proposal_log_path, proposal_queue.history)
+            print(f"Wrote proposal event CSV to: {proposal_log_path}")
         outputs_written = True
 
     try:
         backend.initialize(first_frame, boxes, frame_number)
+        update_proposals(first_frame, frame_number)
         mot.append_mot_results(mot_lines, frame_number, backend.tracks)
         append_v8_debug_rows(debug_lines, frame_number, backend.tracks, args.debug_frame_start, args.debug_frame_end)
         if writer is not None:
-            writer.write(mot.draw_tracks(first_frame, backend.tracks, frame_number, backend.backend_name, backend.status_lines()))
+            writer.write(draw_frame(first_frame))
 
         while True:
             if not paused:
@@ -5067,18 +4435,20 @@ def main() -> int:
                     break
                 last_frame = frame
                 frame_number += 1
-                backend.update(frame, frame_number)
+                if backend.tracks:
+                    backend.update(frame, frame_number)
+                update_proposals(frame, frame_number)
                 mot.append_mot_results(mot_lines, frame_number, backend.tracks)
                 append_v8_debug_rows(debug_lines, frame_number, backend.tracks, args.debug_frame_start, args.debug_frame_end)
             else:
                 frame = last_frame.copy()
 
-            shown = mot.draw_tracks(frame, backend.tracks, frame_number, backend.backend_name, backend.status_lines())
+            shown = draw_frame(frame)
             if writer is not None and not paused:
                 writer.write(shown)
 
             if not args.no_display:
-                cv2.imshow("LoRAT Multi-Object Tracker V8", shown)
+                cv2.imshow("LoRAT Multi-Object Tracker V9", shown)
                 key = cv2.waitKey(30 if not paused else 0) & 0xFF
                 if key == ord("q"):
                     break
@@ -5133,6 +4503,40 @@ def main() -> int:
                                 f"({seconds_spent:.2f}s)."
                             )
                     paused = False
+                if args.enable_proposals and key == ord("]"):
+                    proposal_queue.next()
+                if args.enable_proposals and key == ord("["):
+                    proposal_queue.previous()
+                if args.enable_proposals and key == ord("x"):
+                    rejected = proposal_queue.reject_current()
+                    if rejected is not None:
+                        print(f"Rejected proposal P{rejected.proposal_id} at frame {frame_number}.")
+                        if proposal_log_path is not None:
+                            mot.write_proposal_event_csv(proposal_log_path, proposal_queue.history)
+                if args.enable_proposals and key == ord("y"):
+                    proposal = proposal_queue.current()
+                    if proposal is None:
+                        print("No pending proposal to accept.")
+                    else:
+                        added_tracks = backend.add_tracks(frame, [proposal.bbox], frame_number)
+                        spawned_track_id = added_tracks[0].track_id if added_tracks else None
+                        accepted = proposal_queue.accept_current(spawned_track_id)
+                        if added_tracks:
+                            mot.append_mot_results(mot_lines, frame_number, added_tracks)
+                            append_v8_debug_rows(
+                                debug_lines,
+                                frame_number,
+                                backend.tracks,
+                                args.debug_frame_start,
+                                args.debug_frame_end,
+                            )
+                        if proposal_log_path is not None:
+                            mot.write_proposal_event_csv(proposal_log_path, proposal_queue.history)
+                        if accepted is not None:
+                            print(
+                                f"Accepted proposal P{accepted.proposal_id} at frame {frame_number}; "
+                                f"spawned track {spawned_track_id}."
+                            )
 
             if args.max_frames > 0 and frame_number >= args.max_frames:
                 break

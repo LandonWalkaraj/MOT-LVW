@@ -140,6 +140,12 @@ class TrackState:
     last_crop_edge_density: Optional[float] = None
     last_crop_laplacian_var: Optional[float] = None
     last_crop_contrast: Optional[float] = None
+    v8_initial_feature: Optional[object] = None
+    v8_appearance_feature: Optional[object] = None
+    v8_feature_bank: List[object] = field(default_factory=list)
+    v8_initial_crop_feature: Optional[object] = None
+    v8_appearance_crop_feature: Optional[object] = None
+    v8_crop_feature_bank: List[object] = field(default_factory=list)
 
 
 @dataclass
@@ -165,6 +171,8 @@ class LoRATSlotOutput:
     bbox: BBox
     confidence: Optional[float]
     appearance_hist: Optional[np.ndarray] = None
+    v8_feature: Optional[object] = None
+    v8_crop_feature: Optional[object] = None
 
 
 @dataclass
@@ -198,6 +206,9 @@ class RuntimeStatus:
     object_head_items: int = 0
     max_object_head_batch: int = 0
     object_head_roi_tokens: int = 0
+    crop_reid_forward_calls: int = 0
+    crop_reid_forward_items: int = 0
+    max_crop_reid_batch: int = 0
 
 
 @dataclass(frozen=True)
@@ -717,6 +728,147 @@ MANUAL_EVENT_FIELDS = [
 ]
 
 
+@dataclass
+class ObjectProposal:
+    proposal_id: int
+    frame: int
+    bbox: BBox
+    score: float
+    source: str = "class_agnostic"
+    status: str = "pending"
+    spawned_track_id: Optional[int] = None
+    timestamp: str = field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    def to_row(self) -> Dict[str, object]:
+        return {
+            "timestamp": self.timestamp,
+            "proposal_id": self.proposal_id,
+            "frame": self.frame,
+            "status": self.status,
+            "bbox": bbox_text(self.bbox),
+            "bbox_x": f"{float(self.bbox[0]):.6f}",
+            "bbox_y": f"{float(self.bbox[1]):.6f}",
+            "bbox_w": f"{float(self.bbox[2]):.6f}",
+            "bbox_h": f"{float(self.bbox[3]):.6f}",
+            "bbox_area": f"{bbox_area(self.bbox):.6f}",
+            "score": f"{float(self.score):.6f}",
+            "source": self.source,
+            "spawned_track_id": "" if self.spawned_track_id is None else self.spawned_track_id,
+        }
+
+
+PROPOSAL_EVENT_FIELDS = [
+    "timestamp",
+    "proposal_id",
+    "frame",
+    "status",
+    "bbox",
+    "bbox_x",
+    "bbox_y",
+    "bbox_w",
+    "bbox_h",
+    "bbox_area",
+    "score",
+    "source",
+    "spawned_track_id",
+]
+
+
+class ProposalQueue:
+    def __init__(self, max_pending: int = 64, iou_suppression: float = 0.70) -> None:
+        self.max_pending = max(1, int(max_pending))
+        self.iou_suppression = max(0.0, min(1.0, float(iou_suppression)))
+        self._next_id = 1
+        self._pending: List[ObjectProposal] = []
+        self._history: List[ObjectProposal] = []
+        self._cursor = 0
+
+    @property
+    def pending(self) -> List[ObjectProposal]:
+        return list(self._pending)
+
+    @property
+    def history(self) -> List[ObjectProposal]:
+        return list(self._history)
+
+    def __len__(self) -> int:
+        return len(self._pending)
+
+    def current(self) -> Optional[ObjectProposal]:
+        if not self._pending:
+            return None
+        self._cursor %= len(self._pending)
+        return self._pending[self._cursor]
+
+    def next(self) -> Optional[ObjectProposal]:
+        if not self._pending:
+            return None
+        self._cursor = (self._cursor + 1) % len(self._pending)
+        return self.current()
+
+    def previous(self) -> Optional[ObjectProposal]:
+        if not self._pending:
+            return None
+        self._cursor = (self._cursor - 1) % len(self._pending)
+        return self.current()
+
+    def add_frame_proposals(self, frame_number: int, proposals: Sequence[Tuple[BBox, float, str]]) -> List[ObjectProposal]:
+        added: List[ObjectProposal] = []
+        for bbox, score, source in proposals:
+            if any(bbox_iou(bbox, existing.bbox) >= self.iou_suppression for existing in self._pending):
+                continue
+            proposal = ObjectProposal(
+                proposal_id=self._next_id,
+                frame=int(frame_number),
+                bbox=bbox,
+                score=max(0.0, min(1.0, float(score))),
+                source=source,
+            )
+            self._next_id += 1
+            self._pending.append(proposal)
+            self._history.append(proposal)
+            added.append(proposal)
+        self._pending.sort(key=lambda proposal: proposal.score, reverse=True)
+        if len(self._pending) > self.max_pending:
+            overflow = self._pending[self.max_pending :]
+            for proposal in overflow:
+                proposal.status = "expired"
+            self._pending = self._pending[: self.max_pending]
+        if self._pending:
+            self._cursor %= len(self._pending)
+        else:
+            self._cursor = 0
+        return added
+
+    def accept_current(self, spawned_track_id: Optional[int]) -> Optional[ObjectProposal]:
+        proposal = self.current()
+        if proposal is None:
+            return None
+        proposal.status = "accepted"
+        proposal.spawned_track_id = spawned_track_id
+        self._pending.pop(self._cursor)
+        self._cursor = min(self._cursor, max(0, len(self._pending) - 1))
+        return proposal
+
+    def reject_current(self) -> Optional[ObjectProposal]:
+        proposal = self.current()
+        if proposal is None:
+            return None
+        proposal.status = "rejected"
+        self._pending.pop(self._cursor)
+        self._cursor = min(self._cursor, max(0, len(self._pending) - 1))
+        return proposal
+
+
+def write_proposal_event_csv(path: Path, rows: Sequence[ObjectProposal]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=PROPOSAL_EVENT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row.to_row())
+
+
 def make_manual_reanchor_event(
     frame: int,
     track_id: int,
@@ -1144,6 +1296,164 @@ def measure_crop_information(
     )
 
 
+def _proposal_score(frame: np.ndarray, bbox: BBox, min_area: float) -> float:
+    info = measure_crop_information(frame, bbox, max(16, int(min_area // 4)))
+    area = bbox_area(bbox)
+    area_score = min(1.0, area / max(1.0, float(min_area) * 4.0))
+    return max(0.0, min(1.0, (0.70 * info.score) + (0.30 * area_score)))
+
+
+def _filter_proposal_bbox(
+    frame: np.ndarray,
+    bbox: BBox,
+    min_area: float,
+    max_area_fraction: float,
+    min_side: int,
+    max_aspect_ratio: float,
+) -> Optional[BBox]:
+    clipped = clamp_bbox_to_frame_bounds(frame, bbox)
+    if clipped is None:
+        return None
+    _, _, width, height = clipped
+    area = bbox_area(clipped)
+    frame_area = float(frame.shape[0] * frame.shape[1])
+    if width < min_side or height < min_side:
+        return None
+    if area < min_area or area > (frame_area * max_area_fraction):
+        return None
+    aspect = bbox_aspect_ratio(clipped)
+    if aspect > max_aspect_ratio or (1.0 / aspect) > max_aspect_ratio:
+        return None
+    return clipped
+
+
+def _nms_scored_bboxes(candidates: Sequence[Tuple[BBox, float, str]], iou_threshold: float, limit: int) -> List[Tuple[BBox, float, str]]:
+    selected: List[Tuple[BBox, float, str]] = []
+    for bbox, score, source in sorted(candidates, key=lambda item: item[1], reverse=True):
+        if any(bbox_iou(bbox, chosen_bbox) >= iou_threshold for chosen_bbox, _, _ in selected):
+            continue
+        selected.append((bbox, score, source))
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _selective_search_proposals(
+    frame: np.ndarray,
+    min_area: float,
+    max_area_fraction: float,
+    min_side: int,
+    max_aspect_ratio: float,
+    candidate_limit: int,
+) -> List[Tuple[BBox, float, str]]:
+    ximgproc = getattr(cv2, "ximgproc", None)
+    segmentation = getattr(ximgproc, "segmentation", None) if ximgproc is not None else None
+    if segmentation is None or not hasattr(segmentation, "createSelectiveSearchSegmentation"):
+        return []
+
+    max_dimension = 720.0
+    height, width = frame.shape[:2]
+    scale = min(1.0, max_dimension / max(1.0, float(max(height, width))))
+    search_frame = frame if scale >= 0.999 else cv2.resize(frame, (int(round(width * scale)), int(round(height * scale))))
+
+    search = segmentation.createSelectiveSearchSegmentation()
+    search.setBaseImage(search_frame)
+    search.switchToSelectiveSearchFast()
+    rects = search.process()
+    candidates: List[Tuple[BBox, float, str]] = []
+    max_rects = max(candidate_limit * 500, 5000)
+    inv_scale = 1.0 / max(scale, 1e-6)
+    for x, y, width, height in rects[:max_rects]:
+        bbox = _filter_proposal_bbox(
+            frame,
+            (float(x) * inv_scale, float(y) * inv_scale, float(width) * inv_scale, float(height) * inv_scale),
+            min_area,
+            max_area_fraction,
+            min_side,
+            max_aspect_ratio,
+        )
+        if bbox is None:
+            continue
+        candidates.append((bbox, _proposal_score(frame, bbox, min_area), "selective_search"))
+    return candidates
+
+
+def _contour_proposals(
+    frame: np.ndarray,
+    min_area: float,
+    max_area_fraction: float,
+    min_side: int,
+    max_aspect_ratio: float,
+) -> List[Tuple[BBox, float, str]]:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 60, 140)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates: List[Tuple[BBox, float, str]] = []
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        bbox = _filter_proposal_bbox(
+            frame,
+            (float(x), float(y), float(width), float(height)),
+            min_area,
+            max_area_fraction,
+            min_side,
+            max_aspect_ratio,
+        )
+        if bbox is None:
+            continue
+        score = _proposal_score(frame, bbox, min_area)
+        contour_area = float(cv2.contourArea(contour))
+        fill_score = min(1.0, contour_area / max(1.0, bbox_area(bbox)))
+        candidates.append((bbox, max(0.0, min(1.0, (0.75 * score) + (0.25 * fill_score))), "contour"))
+    return candidates
+
+
+def generate_class_agnostic_proposals(
+    frame: np.ndarray,
+    source: str = "auto",
+    max_proposals: int = 12,
+    min_area: float = 256.0,
+    nms_iou: float = 0.70,
+    max_area_fraction: float = 0.80,
+    min_side: int = 8,
+    max_aspect_ratio: float = 8.0,
+) -> List[Tuple[BBox, float, str]]:
+    """Return class-agnostic candidate boxes as (bbox, score, source)."""
+    max_proposals = max(1, int(max_proposals))
+    candidate_limit = max(max_proposals * 4, max_proposals)
+    candidates: List[Tuple[BBox, float, str]] = []
+
+    if source in ("auto", "selective_search"):
+        candidates.extend(
+            _selective_search_proposals(
+                frame,
+                min_area=min_area,
+                max_area_fraction=max_area_fraction,
+                min_side=min_side,
+                max_aspect_ratio=max_aspect_ratio,
+                candidate_limit=candidate_limit,
+            )
+        )
+        if source == "selective_search":
+            return _nms_scored_bboxes(candidates, nms_iou, max_proposals)
+
+    if source in ("auto", "contour") and (source == "contour" or len(candidates) < max_proposals):
+        candidates.extend(
+            _contour_proposals(
+                frame,
+                min_area=min_area,
+                max_area_fraction=max_area_fraction,
+                min_side=min_side,
+                max_aspect_ratio=max_aspect_ratio,
+            )
+        )
+
+    return _nms_scored_bboxes(candidates, nms_iou, max_proposals)
+
+
 def extract_reid_histogram(frame: np.ndarray, bbox: BBox) -> Optional[np.ndarray]:
     clipped = clip_bbox_to_frame(frame, bbox)
     if clipped is None:
@@ -1565,6 +1875,26 @@ def draw_tracks(
             label += " LOST"
         cv2.rectangle(output, (x, y), (x + w, y + h), color, 2)
         cv2.putText(output, label, (x, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+    return output
+
+
+def draw_proposals(
+    frame: np.ndarray,
+    proposals: Sequence[ObjectProposal],
+    active_proposal_id: Optional[int] = None,
+    max_draw: int = 20,
+) -> np.ndarray:
+    output = frame.copy()
+    for proposal in list(proposals)[: max(0, int(max_draw))]:
+        x, y, w, h = [int(round(value)) for value in proposal.bbox]
+        active = proposal.proposal_id == active_proposal_id
+        color = (255, 255, 0) if active else (255, 180, 0)
+        thickness = 3 if active else 1
+        label = f"P{proposal.proposal_id} {proposal.score:.2f}"
+        if active:
+            label += " current"
+        cv2.rectangle(output, (x, y), (x + w, y + h), color, thickness)
+        cv2.putText(output, label, (x, max(18, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2, cv2.LINE_AA)
     return output
 
 

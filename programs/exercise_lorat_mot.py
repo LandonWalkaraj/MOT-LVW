@@ -126,8 +126,16 @@ def pick_initial_rows(
     min_visibility: float,
     target_tracks: int,
     min_init_tracks: int,
+    selection_mode: str = "largest",
+    min_area: float = 0.0,
+    max_area: float = 0.0,
+    track_ids: Optional[Sequence[int]] = None,
 ) -> Tuple[int, List[GroundTruthRow]]:
     wanted_classes = set(class_ids or [1])
+    wanted_track_ids = set(track_ids or [])
+    min_area = max(0.0, float(min_area or 0.0))
+    max_area = max(0.0, float(max_area or 0.0))
+    selection_mode = (selection_mode or "largest").strip().lower()
 
     def usable(rows: Iterable[GroundTruthRow]) -> List[GroundTruthRow]:
         selected = [
@@ -138,7 +146,24 @@ def pick_initial_rows(
             and row.class_id in wanted_classes
             and row.bbox[2] > 0
             and row.bbox[3] > 0
+            and (not wanted_track_ids or row.track_id in wanted_track_ids)
+            and (min_area <= 0 or (row.bbox[2] * row.bbox[3]) >= min_area)
+            and (max_area <= 0 or (row.bbox[2] * row.bbox[3]) <= max_area)
         ]
+        if wanted_track_ids:
+            return sorted(
+                selected,
+                key=lambda row: (
+                    list(track_ids or []).index(row.track_id) if row.track_id in wanted_track_ids else 10**9,
+                    row.bbox[2] * row.bbox[3],
+                ),
+            )
+        if selection_mode in {"smallest", "area-window", "area_window"}:
+            return sorted(selected, key=lambda row: row.bbox[2] * row.bbox[3])
+        if selection_mode == "middle":
+            by_area = sorted(selected, key=lambda row: row.bbox[2] * row.bbox[3])
+            midpoint = len(by_area) // 2
+            return by_area[midpoint:] + by_area[:midpoint]
         return sorted(selected, key=lambda row: row.bbox[2] * row.bbox[3], reverse=True)
 
     if init_frame != "auto":

@@ -80,6 +80,7 @@ class V8TimingResult:
     profile_template_match_ms_per_update: Optional[float]
     profile_candidate_fusion_ms_per_update: Optional[float]
     profile_reid_appearance_ms_per_update: Optional[float]
+    profile_dinov2_crop_reid_ms_per_update: Optional[float]
     profile_identity_resolve_ms_per_update: Optional[float]
     profile_identity_score_ms_per_update: Optional[float]
     profile_debug_output_ms_per_update: Optional[float]
@@ -93,6 +94,14 @@ class V8TimingResult:
     proof_batched_head_ok_frames: int
     proof_shared_backbone_ok_rate: Optional[float]
     proof_batched_head_ok_rate: Optional[float]
+    dinov2_crop_reid_forward_calls: int
+    dinov2_crop_reid_forward_items: int
+    max_dinov2_crop_reid_batch: int
+    assignment_conflict_rejections: int
+    assignment_conflict_reasons: str
+    assignment_alt_rescue_attempts: int
+    assignment_alt_rescue_hits: int
+    assignment_alt_rescue_rejects: str
     fps_sustains_25: Optional[bool]
     preview_path: Optional[Path]
 
@@ -139,6 +148,8 @@ class V8OutputPaths:
     identity_csv: Path
     identity_summary_csv: Path
     occlusion_survival_csv: Path
+    controlled_occlusion_trials_csv: Path
+    controlled_occlusion_survival_csv: Path
     week2_proof_csv: Path
     candidate_diagnostics_csv: Path
     debug_csv: Path
@@ -158,7 +169,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "v8-only LoRAT benchmark for Week 1/2/3 metrics: bounding-box timing, "
             "small-object area reliability, FPS/memory scaling, shared-frame ViT proof, "
-            "ReID ablation, identity switches, track loss, and occlusion survival."
+            "ReID ablation, identity switches, track loss, and controlled occlusion survival."
         )
     )
     parser.add_argument("--dataset-root", type=Path, default=exercise.DEFAULT_DATASET_ROOT)
@@ -172,6 +183,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-visibility", type=float, default=0.1)
     parser.add_argument("--min-init-tracks", type=int, default=1)
     parser.add_argument("--allow-fewer-tracks", action="store_true")
+    parser.add_argument(
+        "--init-selection",
+        choices=("largest", "smallest", "area-window", "middle"),
+        default="largest",
+        help=(
+            "How to choose GT initialization boxes when no interactive selection is possible. "
+            "largest preserves the original benchmark behavior; smallest/area-window are useful "
+            "for small-object demo runs on Theia."
+        ),
+    )
+    parser.add_argument("--init-min-area", type=float, default=0.0, help="Minimum GT box area for initialization selection.")
+    parser.add_argument("--init-max-area", type=float, default=0.0, help="Maximum GT box area for initialization selection; 0 disables.")
+    parser.add_argument(
+        "--init-track-id",
+        type=int,
+        action="append",
+        help="Specific GT track id to initialize. Repeat for multiple. Overrides area/size ordering after filtering.",
+    )
 
     parser.add_argument("--track-counts", default=DEFAULT_TRACK_COUNTS)
     parser.add_argument("--max-track-count", type=int, default=0, help="Use 1..N instead of --track-counts when positive.")
@@ -190,6 +219,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--identity-correct-iou", type=float, default=0.30)
     parser.add_argument("--identity-competitor-margin", type=float, default=0.05)
     parser.add_argument("--identity-jump-factor", type=float, default=2.0)
+    parser.add_argument(
+        "--controlled-occlusion-durations",
+        default="",
+        help=(
+            "Comma-separated forced occlusion lengths in frames, e.g. 0,5,10,20,40. "
+            "Empty disables the controlled occlusion-duration benchmark."
+        ),
+    )
+    parser.add_argument("--controlled-occlusion-trials-per-duration", type=int, default=3)
+    parser.add_argument("--controlled-occlusion-warmup-frames", type=int, default=10)
+    parser.add_argument("--controlled-occlusion-recovery-frames", type=int, default=30)
+    parser.add_argument(
+        "--controlled-occlusion-mask",
+        choices=("black", "blur", "mean"),
+        default="black",
+        help="How to hide the target during forced occlusion windows.",
+    )
     parser.add_argument(
         "--reid-ablation",
         "--week3-reid-ablation",
@@ -330,6 +376,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v8-memory-min-initial-anchor", type=float, default=v8.DEFAULT_V8_MEMORY_MIN_INITIAL_ANCHOR)
     parser.add_argument("--v8-memory-min-identity-margin", type=float, default=v8.DEFAULT_V8_MEMORY_MIN_IDENTITY_MARGIN)
     parser.add_argument("--v8-window-penalty-ratio", type=float, default=v8.DEFAULT_V8_WINDOW_PENALTY_RATIO)
+    parser.add_argument(
+        "--disable-v8-dinov2-crop-reid",
+        dest="v8_dinov2_crop_reid",
+        action="store_false",
+        default=v8.DEFAULT_V8_DINOV2_CROP_REID,
+        help="Disable literal DINOv2 crop embeddings for Week 3 ReID.",
+    )
+    parser.add_argument("--v8-dinov2-crop-reid-batch", type=int, default=v8.DEFAULT_V8_DINOV2_CROP_REID_BATCH)
+    parser.add_argument("--v8-dinov2-crop-reid-min-area", type=float, default=v8.DEFAULT_V8_DINOV2_CROP_REID_MIN_AREA)
+    parser.add_argument("--v8-assignment-conflict-iou", type=float, default=v8.DEFAULT_V8_ASSIGNMENT_CONFLICT_IOU)
+    parser.add_argument("--v8-assignment-conflict-hard-iou", type=float, default=v8.DEFAULT_V8_ASSIGNMENT_CONFLICT_HARD_IOU)
+    parser.add_argument("--v8-assignment-conflict-score-margin", type=float, default=v8.DEFAULT_V8_ASSIGNMENT_CONFLICT_SCORE_MARGIN)
+    parser.add_argument(
+        "--v8-assignment-conflict-center-ratio",
+        type=float,
+        default=v8.DEFAULT_V8_ASSIGNMENT_CONFLICT_CENTER_RATIO,
+    )
+    parser.add_argument(
+        "--v8-assignment-conflict-containment",
+        type=float,
+        default=v8.DEFAULT_V8_ASSIGNMENT_CONFLICT_CONTAINMENT,
+    )
+    parser.add_argument(
+        "--v8-assignment-conflict-ownership-margin",
+        type=float,
+        default=v8.DEFAULT_V8_ASSIGNMENT_CONFLICT_OWNERSHIP_MARGIN,
+    )
+    parser.add_argument(
+        "--disable-v8-assignment-alt-rescue",
+        dest="v8_assignment_alt_rescue",
+        action="store_false",
+        default=v8.DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_ENABLED,
+    )
+    parser.add_argument(
+        "--v8-assignment-alt-rescue-max-candidates",
+        type=int,
+        default=v8.DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_MAX_CANDIDATES,
+    )
+    parser.add_argument(
+        "--v8-assignment-alt-rescue-min-confidence",
+        type=float,
+        default=v8.DEFAULT_V8_ASSIGNMENT_ALT_RESCUE_MIN_CONFIDENCE,
+    )
     return parser.parse_args()
 
 
@@ -337,6 +426,20 @@ def parse_track_counts(args: argparse.Namespace) -> List[int]:
     if args.max_track_count > 0:
         return list(range(1, args.max_track_count + 1))
     return bench.parse_int_list(args.track_counts)
+
+
+def parse_controlled_occlusion_durations(args: argparse.Namespace) -> List[int]:
+    text = str(getattr(args, "controlled_occlusion_durations", "") or "").strip()
+    if not text:
+        return []
+    durations = sorted(
+        {
+            max(0, int(value.strip()))
+            for value in text.replace(";", ",").split(",")
+            if value.strip()
+        }
+    )
+    return durations
 
 
 def normalized_configs(args: argparse.Namespace) -> List[str]:
@@ -376,6 +479,17 @@ def select_sequences(args: argparse.Namespace) -> List[Path]:
 
 def run_label(args: argparse.Namespace, sequences: Sequence[Path], configs: Sequence[str], track_counts: Sequence[int]) -> str:
     base = bench.make_run_label(args, sequences, configs, track_counts)
+    selection_parts: List[str] = []
+    if getattr(args, "init_selection", "largest") != "largest":
+        selection_parts.append(f"init-{args.init_selection}")
+    if getattr(args, "init_min_area", 0.0) > 0:
+        selection_parts.append(f"minarea-{int(args.init_min_area)}")
+    if getattr(args, "init_max_area", 0.0) > 0:
+        selection_parts.append(f"maxarea-{int(args.init_max_area)}")
+    if getattr(args, "init_track_id", None):
+        selection_parts.append("ids-" + "-".join(str(value) for value in args.init_track_id))
+    if selection_parts:
+        base = f"{base}_{'_'.join(selection_parts)}"
     return bench.slugify(f"v8_{base}")
 
 
@@ -395,6 +509,8 @@ def default_output_paths(args: argparse.Namespace, label: str) -> V8OutputPaths:
     identity_csv = bench.unique_path(args.identity_csv.resolve() if args.identity_csv else run_root / "identity_observations_sampled.csv")
     identity_summary_csv = bench.unique_path(run_root / "identity_recovery_summary.csv")
     occlusion_survival_csv = bench.unique_path(run_root / "occlusion_survival.csv")
+    controlled_occlusion_trials_csv = bench.unique_path(run_root / "controlled_occlusion_trials.csv")
+    controlled_occlusion_survival_csv = bench.unique_path(run_root / "controlled_occlusion_survival.csv")
     week2_proof_csv = bench.unique_path(args.week2_proof_csv.resolve() if args.week2_proof_csv else run_root / "week2_shared_backbone_proof.csv")
     candidate_diagnostics_csv = bench.unique_path(
         args.candidate_diagnostics_csv.resolve()
@@ -411,6 +527,8 @@ def default_output_paths(args: argparse.Namespace, label: str) -> V8OutputPaths:
         identity_csv,
         identity_summary_csv,
         occlusion_survival_csv,
+        controlled_occlusion_trials_csv,
+        controlled_occlusion_survival_csv,
         week2_proof_csv,
         candidate_diagnostics_csv,
         debug_csv,
@@ -426,6 +544,8 @@ def default_output_paths(args: argparse.Namespace, label: str) -> V8OutputPaths:
         identity_csv=identity_csv,
         identity_summary_csv=identity_summary_csv,
         occlusion_survival_csv=occlusion_survival_csv,
+        controlled_occlusion_trials_csv=controlled_occlusion_trials_csv,
+        controlled_occlusion_survival_csv=controlled_occlusion_survival_csv,
         week2_proof_csv=week2_proof_csv,
         candidate_diagnostics_csv=candidate_diagnostics_csv,
         debug_csv=debug_csv,
@@ -657,6 +777,348 @@ def collect_sampled_observations(
         if collect_full_area:
             full_area.append(observation)
     return sampled_area, full_area, identity_rows
+
+
+def gt_row_for_track(
+    gt_by_frame: Dict[int, List[exercise.GroundTruthRow]],
+    frame_number: int,
+    gt_track_id: int,
+    min_visibility: float,
+) -> Optional[exercise.GroundTruthRow]:
+    for row in gt_by_frame.get(frame_number, []):
+        if row.track_id == gt_track_id and row.confidence != 0 and row.visibility >= min_visibility:
+            return row
+    return None
+
+
+def mask_bbox_in_frame(frame, bbox: mot.BBox, mode: str) -> None:
+    height, width = frame.shape[:2]
+    x, y, w, h = bbox
+    x1 = max(0, min(width, int(round(x))))
+    y1 = max(0, min(height, int(round(y))))
+    x2 = max(0, min(width, int(round(x + w))))
+    y2 = max(0, min(height, int(round(y + h))))
+    if x2 <= x1 or y2 <= y1:
+        return
+    region = frame[y1:y2, x1:x2]
+    if mode == "blur" and region.size:
+        kernel = max(9, int(min(x2 - x1, y2 - y1) // 3) | 1)
+        frame[y1:y2, x1:x2] = cv2.GaussianBlur(region, (kernel, kernel), 0)
+    elif mode == "mean" and region.size:
+        frame[y1:y2, x1:x2] = region.reshape(-1, region.shape[-1]).mean(axis=0)
+    else:
+        frame[y1:y2, x1:x2] = 0
+
+
+def controlled_occlusion_candidate_starts(
+    gt_by_frame: Dict[int, List[exercise.GroundTruthRow]],
+    gt_track_ids: Sequence[int],
+    init_frame: int,
+    last_frame: int,
+    duration: int,
+    warmup_frames: int,
+    recovery_frames: int,
+    min_visibility: float,
+) -> List[Tuple[int, int]]:
+    start_min = init_frame + max(1, warmup_frames)
+    start_max = last_frame - duration - recovery_frames
+    if start_max < start_min:
+        return []
+    candidates: List[Tuple[int, int]] = []
+    for gt_track_id in gt_track_ids:
+        for start_frame in range(start_min, start_max + 1):
+            pre_frame = max(init_frame, start_frame - 1)
+            reappear_frame = start_frame + duration
+            recovery_end = start_frame + duration + recovery_frames
+            if (
+                gt_row_for_track(gt_by_frame, pre_frame, gt_track_id, min_visibility) is not None
+                and gt_row_for_track(gt_by_frame, reappear_frame, gt_track_id, min_visibility) is not None
+                and gt_row_for_track(gt_by_frame, recovery_end, gt_track_id, min_visibility) is not None
+            ):
+                candidates.append((start_frame, gt_track_id))
+    return candidates
+
+
+def evenly_sample_trials(candidates: Sequence[Tuple[int, int]], limit: int) -> List[Tuple[int, int]]:
+    if limit <= 0 or not candidates:
+        return []
+    if len(candidates) <= limit:
+        return list(candidates)
+    if limit == 1:
+        return [candidates[len(candidates) // 2]]
+    selected: List[Tuple[int, int]] = []
+    for index in range(limit):
+        candidate_index = round(index * (len(candidates) - 1) / (limit - 1))
+        selected.append(candidates[candidate_index])
+    return selected
+
+
+def controlled_identity_state(
+    track: mot.TrackState,
+    gt_track_id: int,
+    gt_by_frame: Dict[int, List[exercise.GroundTruthRow]],
+    frame_number: int,
+    min_visibility: float,
+    identity_correct_iou: float,
+    identity_competitor_margin: float,
+) -> Tuple[float, float, Optional[int], float, bool, bool, bool]:
+    visible_rows = visible_gt_rows(gt_by_frame, frame_number, min_visibility)
+    gt_row = next((row for row in visible_rows if row.track_id == gt_track_id), None)
+    own_iou = exercise.bbox_iou(track.bbox, gt_row.bbox) if gt_row is not None else 0.0
+    other_ious = [
+        (row.track_id, exercise.bbox_iou(track.bbox, row.bbox))
+        for row in visible_rows
+        if row.track_id != gt_track_id
+    ]
+    best_other_iou = max((iou for _, iou in other_ious), default=0.0)
+    matched_gt_id, matched_gt_iou = mot.matched_gt_id_from_ious(
+        gt_track_id,
+        own_iou,
+        other_ious,
+        identity_correct_iou,
+    )
+    ok = bool(getattr(track, "ok", False))
+    correct = (
+        gt_row is not None
+        and ok
+        and own_iou >= identity_correct_iou
+        and own_iou + identity_competitor_margin >= best_other_iou
+    )
+    identity_switch = gt_row is not None and matched_gt_id is not None and matched_gt_id != gt_track_id
+    lifecycle_state = mot.set_track_lifecycle(track)
+    track_lost = (not ok) or lifecycle_state == mot.TrackLifecycle.LOST or (gt_row is not None and matched_gt_id is None)
+    return own_iou, best_other_iou, matched_gt_id, matched_gt_iou, correct, identity_switch, track_lost
+
+
+def run_controlled_occlusion_trial(
+    args: argparse.Namespace,
+    sequence_path: Path,
+    lorat_config: str,
+    target_tracks: int,
+    reid_mode: str,
+    disable_reid: bool,
+    duration_frames: int,
+    trial_index: int,
+    occlusion_start_frame: int,
+    occluded_gt_id: int,
+) -> Dict[str, object]:
+    image_paths = exercise.get_image_paths(sequence_path)
+    gt_by_frame = exercise.read_gt(sequence_path)
+    fps, sequence_length = exercise.read_sequence_info(sequence_path)
+    init_frame, init_rows = exercise.pick_initial_rows(
+        gt_by_frame,
+        args.init_frame,
+        args.class_id,
+        args.min_visibility,
+        target_tracks,
+        max(args.min_init_tracks, target_tracks),
+        args.init_selection,
+        args.init_min_area,
+        args.init_max_area,
+        args.init_track_id,
+    )
+    boxes = [row.bbox for row in init_rows]
+    gt_track_ids = [row.track_id for row in init_rows]
+    init_index = exercise.frame_to_image_index(init_frame)
+    init_frame_image = cv2.imread(str(image_paths[init_index]))
+    if init_frame_image is None:
+        raise RuntimeError(f"Unable to read frame: {image_paths[init_index]}")
+
+    case_args = copy.copy(args)
+    case_args.reid_mode = reid_mode
+    case_args.disable_identity_arbitration = bool(disable_reid)
+    run_args = tracker_args_for_run(case_args, lorat_config, target_tracks)
+    source = SimpleNamespace(name=sequence_path.name, fps=fps, length=sequence_length or len(image_paths))
+    backend = v8.create_backend(run_args, source, target_tracks)
+    occlusion_end_frame = occlusion_start_frame + duration_frames - 1
+    recovery_start_frame = occlusion_start_frame + duration_frames
+    recovery_end_frame = min(len(image_paths), recovery_start_frame + args.controlled_occlusion_recovery_frames)
+    pre_frame = max(init_frame, occlusion_start_frame - 1)
+    pre_iou = 0.0
+    pre_correct = False
+    post_ious: List[float] = []
+    post_iou50_count = 0
+    recovered = False
+    first_recovery_frame: Optional[int] = None
+    identity_switch_after = False
+    track_lost_after = False
+    final_iou = 0.0
+    final_state = ""
+    frames_to_recover: Optional[int] = None
+
+    try:
+        backend.initialize(init_frame_image, boxes, init_frame)
+        tracker_to_gt_id = {
+            track.track_id: gt_track_id
+            for track, gt_track_id in zip(backend.tracks, gt_track_ids)
+            if gt_track_id is not None
+        }
+        occluded_tracker_id = next(
+            (track_id for track_id, gt_track_id in tracker_to_gt_id.items() if gt_track_id == occluded_gt_id),
+            None,
+        )
+        if occluded_tracker_id is None:
+            raise RuntimeError(f"Controlled occlusion GT id {occluded_gt_id} was not initialized.")
+
+        for image_index in range(init_index + 1, recovery_end_frame):
+            frame_number = image_index + 1
+            frame = cv2.imread(str(image_paths[image_index]))
+            if frame is None:
+                continue
+            if duration_frames > 0 and occlusion_start_frame <= frame_number <= occlusion_end_frame:
+                gt_row = gt_row_for_track(gt_by_frame, frame_number, occluded_gt_id, 0.0)
+                if gt_row is not None:
+                    mask_bbox_in_frame(frame, gt_row.bbox, args.controlled_occlusion_mask)
+            backend.update(frame, frame_number)
+            track = next((item for item in backend.tracks if item.track_id == occluded_tracker_id), None)
+            if track is None:
+                continue
+            own_iou, _, matched_gt_id, _, correct, identity_switch, track_lost = controlled_identity_state(
+                track,
+                occluded_gt_id,
+                gt_by_frame,
+                frame_number,
+                args.min_visibility,
+                args.identity_correct_iou,
+                args.identity_competitor_margin,
+            )
+            if frame_number == pre_frame:
+                pre_iou = own_iou
+                pre_correct = correct
+            if recovery_start_frame <= frame_number <= recovery_end_frame:
+                post_ious.append(own_iou)
+                if own_iou >= args.identity_correct_iou:
+                    post_iou50_count += int(own_iou >= 0.50)
+                identity_switch_after = identity_switch_after or identity_switch
+                track_lost_after = track_lost_after or track_lost
+                if correct and not recovered:
+                    recovered = True
+                    first_recovery_frame = frame_number
+                    frames_to_recover = max(0, frame_number - recovery_start_frame)
+                final_iou = own_iou
+                final_state = str(getattr(track, "state", ""))
+    finally:
+        backend.close()
+
+    valid_trial = bool(pre_correct)
+    survived = bool(valid_trial and recovered and not identity_switch_after)
+    return {
+        "sequence": sequence_path.name,
+        "lorat_config": lorat_config,
+        "execution_mode": EXECUTION_MODE,
+        "reid_mode": reid_mode,
+        "target_tracks": target_tracks,
+        "duration_frames": duration_frames,
+        "trial_index": trial_index,
+        "occluded_gt_id": occluded_gt_id,
+        "occluded_tracker_id": occluded_tracker_id,
+        "occlusion_start_frame": occlusion_start_frame,
+        "occlusion_end_frame": occlusion_end_frame if duration_frames > 0 else "",
+        "recovery_start_frame": recovery_start_frame,
+        "recovery_end_frame": recovery_end_frame,
+        "pre_iou": pre_iou,
+        "pre_correct": int(pre_correct),
+        "valid_trial": int(valid_trial),
+        "recovered": int(recovered),
+        "survived": int(survived),
+        "identity_lost": int(not survived),
+        "first_recovery_frame": first_recovery_frame if first_recovery_frame is not None else "",
+        "frames_to_recover": frames_to_recover if frames_to_recover is not None else "",
+        "post_mean_iou": statistics.fmean(post_ious) if post_ious else None,
+        "post_iou50": (post_iou50_count / len(post_ious)) if post_ious else None,
+        "identity_switch_after": int(identity_switch_after),
+        "track_lost_after": int(track_lost_after),
+        "final_iou": final_iou,
+        "final_state": final_state,
+        "rule": (
+            f"valid if pre-occlusion IoU >= {args.identity_correct_iou}; "
+            f"survived if same GT recovered within {args.controlled_occlusion_recovery_frames} frames "
+            "without an identity switch"
+        ),
+    }
+
+
+def run_controlled_occlusion_benchmark(
+    args: argparse.Namespace,
+    sequences: Sequence[Path],
+    configs: Sequence[str],
+    track_counts: Sequence[int],
+    reid_modes: Sequence[Tuple[str, bool]],
+    debug_rows: List[Dict[str, object]],
+    debug_csv: Path,
+) -> List[Dict[str, object]]:
+    durations = parse_controlled_occlusion_durations(args)
+    if not durations:
+        return []
+    trial_rows: List[Dict[str, object]] = []
+    for lorat_config in configs:
+        for sequence_path in sequences:
+            image_paths = exercise.get_image_paths(sequence_path)
+            gt_by_frame = exercise.read_gt(sequence_path)
+            last_frame = len(image_paths)
+            for target_tracks in track_counts:
+                init_frame, init_rows = exercise.pick_initial_rows(
+                    gt_by_frame,
+                    args.init_frame,
+                    args.class_id,
+                    args.min_visibility,
+                    target_tracks,
+                    max(args.min_init_tracks, target_tracks),
+                    args.init_selection,
+                    args.init_min_area,
+                    args.init_max_area,
+                    args.init_track_id,
+                )
+                if len(init_rows) < target_tracks and not args.allow_fewer_tracks:
+                    continue
+                gt_track_ids = [row.track_id for row in init_rows]
+                for duration in durations:
+                    candidates = controlled_occlusion_candidate_starts(
+                        gt_by_frame,
+                        gt_track_ids,
+                        init_frame,
+                        last_frame,
+                        duration,
+                        args.controlled_occlusion_warmup_frames,
+                        args.controlled_occlusion_recovery_frames,
+                        args.min_visibility,
+                    )
+                    starts = evenly_sample_trials(candidates, args.controlled_occlusion_trials_per_duration)
+                    if not starts:
+                        record_debug(
+                            debug_rows,
+                            debug_csv,
+                            "controlled_occlusion_skip",
+                            sequence=sequence_path.name,
+                            lorat_config=lorat_config,
+                            target_tracks=target_tracks,
+                            reason=f"duration={duration}; no visible before/after windows",
+                        )
+                        continue
+                    for reid_mode, disable_reid in reid_modes:
+                        for trial_index, (start_frame, occluded_gt_id) in enumerate(starts, start=1):
+                            if STOP_REQUESTED:
+                                return trial_rows
+                            row = run_controlled_occlusion_trial(
+                                args,
+                                sequence_path,
+                                lorat_config,
+                                target_tracks,
+                                reid_mode,
+                                disable_reid,
+                                duration,
+                                trial_index,
+                                start_frame,
+                                occluded_gt_id,
+                            )
+                            trial_rows.append(row)
+                            print(
+                                f"Controlled occlusion {sequence_path.name} {lorat_config} "
+                                f"N={target_tracks} {reid_mode} duration={duration} "
+                                f"trial={trial_index}: survived={row['survived']} valid={row['valid_trial']}",
+                                flush=True,
+                            )
+    return trial_rows
 
 
 def coerce_bbox(value: object) -> Optional[mot.BBox]:
@@ -988,6 +1450,61 @@ def summarize_occlusion_survival(identity_rows: Sequence[IdentityObservation]) -
     return summaries
 
 
+def summarize_controlled_occlusion(trial_rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    grouped: Dict[Tuple[str, str, str, int, int], List[Dict[str, object]]] = {}
+    for row in trial_rows:
+        key = (
+            str(row.get("sequence", "")),
+            str(row.get("lorat_config", "")),
+            str(row.get("reid_mode", "")),
+            int(row.get("target_tracks", 0) or 0),
+            int(row.get("duration_frames", 0) or 0),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    summaries: List[Dict[str, object]] = []
+    for (sequence, lorat_config, reid_mode, target_tracks, duration_frames), rows in sorted(grouped.items()):
+        valid_rows = [row for row in rows if int(row.get("valid_trial", 0) or 0)]
+        denominator = valid_rows or rows
+        survived_rows = [row for row in denominator if int(row.get("survived", 0) or 0)]
+        recovered_rows = [row for row in denominator if int(row.get("recovered", 0) or 0)]
+        recovery_delays = [
+            float(row["frames_to_recover"])
+            for row in recovered_rows
+            if row.get("frames_to_recover") not in ("", None)
+        ]
+        post_ious = [
+            float(row["post_mean_iou"])
+            for row in denominator
+            if row.get("post_mean_iou") not in ("", None)
+        ]
+        summaries.append(
+            {
+                "sequence": sequence,
+                "lorat_config": lorat_config,
+                "reid_mode": reid_mode,
+                "target_tracks": target_tracks,
+                "duration_frames": duration_frames,
+                "trials": len(rows),
+                "valid_trials": len(valid_rows),
+                "survived_trials": len(survived_rows),
+                "recovered_trials": len(recovered_rows),
+                "survival_rate": (len(survived_rows) / len(denominator)) if denominator else None,
+                "recovery_rate": (len(recovered_rows) / len(denominator)) if denominator else None,
+                "identity_lost_rate": (
+                    sum(1 for row in denominator if int(row.get("identity_lost", 0) or 0)) / len(denominator)
+                    if denominator
+                    else None
+                ),
+                "mean_frames_to_recover": statistics.fmean(recovery_delays) if recovery_delays else None,
+                "mean_post_occlusion_iou": statistics.fmean(post_ious) if post_ious else None,
+                "identity_switch_after_count": sum(int(row.get("identity_switch_after", 0) or 0) for row in denominator),
+                "track_lost_after_count": sum(int(row.get("track_lost_after", 0) or 0) for row in denominator),
+            }
+        )
+    return summaries
+
+
 def parse_week2_proof_lines(lines: Sequence[str]) -> List[Dict[str, str]]:
     if not lines:
         return []
@@ -1086,6 +1603,10 @@ def run_benchmark_case(
         args.min_visibility,
         target_tracks,
         max(args.min_init_tracks, target_tracks),
+        args.init_selection,
+        args.init_min_area,
+        args.init_max_area,
+        args.init_track_id,
     )
     if len(init_rows) < target_tracks and not args.allow_fewer_tracks:
         reason = f"only {len(init_rows)} usable GT tracks at init frame {init_frame}"
@@ -1358,6 +1879,7 @@ def run_benchmark_case(
         profile_template_match_ms_per_update=profile_ms_per_update(runtime_status, "template_match"),
         profile_candidate_fusion_ms_per_update=profile_ms_per_update(runtime_status, "candidate_fusion"),
         profile_reid_appearance_ms_per_update=profile_ms_per_update(runtime_status, "reid_appearance"),
+        profile_dinov2_crop_reid_ms_per_update=profile_ms_per_update(runtime_status, "dinov2_crop_reid"),
         profile_identity_resolve_ms_per_update=profile_ms_per_update(runtime_status, "identity_resolve"),
         profile_identity_score_ms_per_update=profile_ms_per_update(runtime_status, "identity_score"),
         profile_debug_output_ms_per_update=profile_ms_per_update(runtime_status, "debug_output"),
@@ -1371,6 +1893,14 @@ def run_benchmark_case(
         proof_batched_head_ok_frames=int(proof_summary["head_ok_frames"]),
         proof_shared_backbone_ok_rate=proof_summary["shared_ok_rate"],  # type: ignore[arg-type]
         proof_batched_head_ok_rate=proof_summary["head_ok_rate"],  # type: ignore[arg-type]
+        dinov2_crop_reid_forward_calls=int(getattr(runtime_status, "crop_reid_forward_calls", 0)),
+        dinov2_crop_reid_forward_items=int(getattr(runtime_status, "crop_reid_forward_items", 0)),
+        max_dinov2_crop_reid_batch=int(getattr(runtime_status, "max_crop_reid_batch", 0)),
+        assignment_conflict_rejections=int(getattr(runtime_status, "v8_assignment_conflict_rejections", 0)),
+        assignment_conflict_reasons=str(getattr(runtime_status, "v8_assignment_conflict_reasons", "")),
+        assignment_alt_rescue_attempts=int(getattr(runtime_status, "v8_assignment_alt_rescue_attempts", 0)),
+        assignment_alt_rescue_hits=int(getattr(runtime_status, "v8_assignment_alt_rescue_hits", 0)),
+        assignment_alt_rescue_rejects=str(getattr(runtime_status, "v8_assignment_alt_rescue_rejects", "")),
         fps_sustains_25=(fps_tracking is not None and fps_tracking >= args.fps_threshold),
         preview_path=preview_path if args.save_video else None,
     )
@@ -1396,6 +1926,7 @@ def run_benchmark_case(
         profile_template_match_ms_per_update=bench.optional_float(timing.profile_template_match_ms_per_update),
         profile_candidate_fusion_ms_per_update=bench.optional_float(timing.profile_candidate_fusion_ms_per_update),
         profile_reid_appearance_ms_per_update=bench.optional_float(timing.profile_reid_appearance_ms_per_update),
+        profile_dinov2_crop_reid_ms_per_update=bench.optional_float(timing.profile_dinov2_crop_reid_ms_per_update),
         profile_identity_resolve_ms_per_update=bench.optional_float(timing.profile_identity_resolve_ms_per_update),
         profile_identity_score_ms_per_update=bench.optional_float(timing.profile_identity_score_ms_per_update),
         profile_debug_output_ms_per_update=bench.optional_float(timing.profile_debug_output_ms_per_update),
@@ -1406,6 +1937,14 @@ def run_benchmark_case(
         profile_unbucketed_ms_per_update=bench.optional_float(timing.profile_unbucketed_ms_per_update),
         proof_shared_ok_rate=bench.optional_float(timing.proof_shared_backbone_ok_rate),
         proof_head_ok_rate=bench.optional_float(timing.proof_batched_head_ok_rate),
+        dinov2_crop_reid_forward_calls=timing.dinov2_crop_reid_forward_calls,
+        dinov2_crop_reid_forward_items=timing.dinov2_crop_reid_forward_items,
+        max_dinov2_crop_reid_batch=timing.max_dinov2_crop_reid_batch,
+        assignment_conflict_rejections=timing.assignment_conflict_rejections,
+        assignment_conflict_reasons=timing.assignment_conflict_reasons,
+        assignment_alt_rescue_attempts=timing.assignment_alt_rescue_attempts,
+        assignment_alt_rescue_hits=timing.assignment_alt_rescue_hits,
+        assignment_alt_rescue_rejects=timing.assignment_alt_rescue_rejects,
     )
     print(
         f"v8 {sequence_path.name} {lorat_config} N={target_tracks}: "
@@ -1414,7 +1953,9 @@ def run_benchmark_case(
         f"track_ms_per_box={bench.optional_float(tracking_ms_per_bbox, 3)}, "
         f"iou50={bench.optional_float(iou50, 3)}, "
         f"shared_calls/frame={bench.optional_float(shared_calls_per_frame, 3)}, "
-        f"head_items/update={bench.optional_float(object_items_per_update, 3)}",
+        f"head_items/update={bench.optional_float(object_items_per_update, 3)}, "
+        f"conflicts={timing.assignment_conflict_rejections}, "
+        f"alt_rescue={timing.assignment_alt_rescue_hits}/{timing.assignment_alt_rescue_attempts}",
         flush=True,
     )
     return timing, sampled_area, full_area, identity_rows
@@ -1471,6 +2012,7 @@ def write_timing_csv(path: Path, rows: Sequence[V8TimingResult]) -> None:
         "profile_template_match_ms_per_update",
         "profile_candidate_fusion_ms_per_update",
         "profile_reid_appearance_ms_per_update",
+        "profile_dinov2_crop_reid_ms_per_update",
         "profile_identity_resolve_ms_per_update",
         "profile_identity_score_ms_per_update",
         "profile_debug_output_ms_per_update",
@@ -1484,6 +2026,14 @@ def write_timing_csv(path: Path, rows: Sequence[V8TimingResult]) -> None:
         "proof_batched_head_ok_frames",
         "proof_shared_backbone_ok_rate",
         "proof_batched_head_ok_rate",
+        "dinov2_crop_reid_forward_calls",
+        "dinov2_crop_reid_forward_items",
+        "max_dinov2_crop_reid_batch",
+        "assignment_conflict_rejections",
+        "assignment_conflict_reasons",
+        "assignment_alt_rescue_attempts",
+        "assignment_alt_rescue_hits",
+        "assignment_alt_rescue_rejects",
         "fps_sustains_25",
         "preview_path",
     ]
@@ -1542,6 +2092,7 @@ def write_timing_csv(path: Path, rows: Sequence[V8TimingResult]) -> None:
                     "profile_template_match_ms_per_update": bench.optional_float(row.profile_template_match_ms_per_update),
                     "profile_candidate_fusion_ms_per_update": bench.optional_float(row.profile_candidate_fusion_ms_per_update),
                     "profile_reid_appearance_ms_per_update": bench.optional_float(row.profile_reid_appearance_ms_per_update),
+                    "profile_dinov2_crop_reid_ms_per_update": bench.optional_float(row.profile_dinov2_crop_reid_ms_per_update),
                     "profile_identity_resolve_ms_per_update": bench.optional_float(row.profile_identity_resolve_ms_per_update),
                     "profile_identity_score_ms_per_update": bench.optional_float(row.profile_identity_score_ms_per_update),
                     "profile_debug_output_ms_per_update": bench.optional_float(row.profile_debug_output_ms_per_update),
@@ -1555,6 +2106,14 @@ def write_timing_csv(path: Path, rows: Sequence[V8TimingResult]) -> None:
                     "proof_batched_head_ok_frames": row.proof_batched_head_ok_frames,
                     "proof_shared_backbone_ok_rate": bench.optional_float(row.proof_shared_backbone_ok_rate),
                     "proof_batched_head_ok_rate": bench.optional_float(row.proof_batched_head_ok_rate),
+                    "dinov2_crop_reid_forward_calls": row.dinov2_crop_reid_forward_calls,
+                    "dinov2_crop_reid_forward_items": row.dinov2_crop_reid_forward_items,
+                    "max_dinov2_crop_reid_batch": row.max_dinov2_crop_reid_batch,
+                    "assignment_conflict_rejections": row.assignment_conflict_rejections,
+                    "assignment_conflict_reasons": row.assignment_conflict_reasons,
+                    "assignment_alt_rescue_attempts": row.assignment_alt_rescue_attempts,
+                    "assignment_alt_rescue_hits": row.assignment_alt_rescue_hits,
+                    "assignment_alt_rescue_rejects": row.assignment_alt_rescue_rejects,
                     "fps_sustains_25": "" if row.fps_sustains_25 is None else str(row.fps_sustains_25),
                     "preview_path": str(row.preview_path or ""),
                 }
@@ -1745,6 +2304,7 @@ def write_debug_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
         "profile_template_match_ms_per_update",
         "profile_candidate_fusion_ms_per_update",
         "profile_reid_appearance_ms_per_update",
+        "profile_dinov2_crop_reid_ms_per_update",
         "profile_identity_resolve_ms_per_update",
         "profile_identity_score_ms_per_update",
         "profile_debug_output_ms_per_update",
@@ -1755,6 +2315,9 @@ def write_debug_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
         "profile_unbucketed_ms_per_update",
         "proof_shared_ok_rate",
         "proof_head_ok_rate",
+        "dinov2_crop_reid_forward_calls",
+        "dinov2_crop_reid_forward_items",
+        "max_dinov2_crop_reid_batch",
         "reason",
     ]
     with path.open("w", newline="", encoding="utf-8") as file:
@@ -1864,6 +2427,7 @@ def write_summary_md(
     area_rows: Sequence[bench.AreaSummary],
     identity_rows: Sequence[IdentityObservation],
     candidate_rows: Sequence[Dict[str, object]],
+    controlled_occlusion_rows: Sequence[Dict[str, object]],
 ) -> None:
     lines = [
         "# LoRAT v8 Benchmark Summary",
@@ -1876,6 +2440,9 @@ def write_summary_md(
         f"- GPU profile label: `{args.gpu_profile}`",
         f"- Max frames per case: `{args.max_frames if args.max_frames > 0 else 'full sequence'}`",
         f"- Track counts: `{','.join(str(value) for value in parse_track_counts(args))}`",
+        f"- Initialization selection: `{args.init_selection}`",
+        f"- Initialization area window: min `{args.init_min_area}` px, max `{args.init_max_area if args.init_max_area > 0 else 'disabled'}` px",
+        f"- Explicit initialization GT IDs: `{','.join(str(value) for value in args.init_track_id) if args.init_track_id else 'none'}`",
         "",
         "## Metric Definitions",
         "",
@@ -1886,9 +2453,11 @@ def write_summary_md(
         "- IoU@0.50 is the fraction of sampled boxes whose IoU is at least `0.50`.",
         f"- Reliable area-bin rule: IoU@0.50 >= `{args.reliable_iou50}`, mean IoU >= `{args.reliable_mean_iou}`, and samples >= `{args.min_area_samples}`.",
         f"- Every-`{args.identity_sample_interval}`-frame identity check: current GT IoU >= `{args.identity_correct_iou}` and no other visible GT beats it by more than `{args.identity_competitor_margin}`.",
+        "- ReID-on mode extracts explicit DINOv2 crop embeddings by batching candidate image crops through the LoRA-adapted DINOv2 backbone, then compares them with per-track crop-memory banks.",
         "- Identity switch counts a sampled frame where the tracker box matches a different visible GT object than the initialized GT object.",
         "- Track loss counts a sampled frame where the track is marked lost/not-ok or no visible GT object reaches the identity IoU threshold.",
-        "- Occlusion survival reports the longest sampled uncertain/occluded gap that later returns to a correct object match.",
+        "- Natural occlusion diagnostics report the longest sampled uncertain/occluded gap that later returns to a correct object match.",
+        "- Controlled occlusion survival masks the initialized object's current GT box for fixed durations, then measures whether the same track reattaches to the same GT identity within the recovery window.",
         f"- 25 FPS capacity rule: maximum actual N with tracking FPS >= `{args.fps_threshold}`.",
         "- Week 2 proof columns show one shared frame-backbone call per tracked frame and one batched object-head operation whose item count scales with object count.",
         "- v8 FPS profile values are elapsed milliseconds per tracked update frame, aggregated from tracker-side timers.",
@@ -1900,7 +2469,9 @@ def write_summary_md(
         f"- Sampled area observations: `{paths.observations_csv}`",
         f"- Identity observations: `{paths.identity_csv}`",
         f"- Identity/ReID summary: `{paths.identity_summary_csv}`",
-        f"- Occlusion survival: `{paths.occlusion_survival_csv}`",
+        f"- Natural occlusion diagnostics: `{paths.occlusion_survival_csv}`",
+        f"- Controlled occlusion trials: `{paths.controlled_occlusion_trials_csv}`",
+        f"- Controlled occlusion survival: `{paths.controlled_occlusion_survival_csv}`",
         f"- Week 2 shared-backbone proof: `{paths.week2_proof_csv}`",
         f"- V8 candidate/oracle diagnostics: `{paths.candidate_diagnostics_csv}`",
         f"- Debug log: `{paths.debug_csv}`",
@@ -1909,10 +2480,10 @@ def write_summary_md(
         lines.append(f"- Every-frame area observations: `{paths.full_observations_csv}`")
     lines.extend(["", "## Timing / Memory", ""])
     lines.append(
-        "| Sequence | Config | ReID Mode | N Target | N Actual | FPS Track | Track ms/box | Mean IoU | IoU@0.50 | Peak GPU Reserved MB | Shared Calls/Frame | Head Items/Update | Week2 Shared OK | Week2 Head OK | 25 FPS |"
+        "| Sequence | Config | ReID Mode | N Target | N Actual | FPS Track | Track ms/box | Mean IoU | IoU@0.50 | Peak GPU Reserved MB | Shared Calls/Frame | Head Items/Update | DINOv2 Crop Calls | DINOv2 Crop Items | Week2 Shared OK | Week2 Head OK | 25 FPS |"
     )
     lines.append(
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     )
     for row in timing_rows:
         lines.append(
@@ -1922,15 +2493,17 @@ def write_summary_md(
             f"{bench.optional_float(row.gpu_memory_peak_reserved_mb, 1)} | "
             f"{bench.optional_float(row.shared_backbone_calls_per_frame, 3)} | "
             f"{bench.optional_float(row.object_head_items_per_update_frame, 3)} | "
+            f"{row.dinov2_crop_reid_forward_calls} | "
+            f"{row.dinov2_crop_reid_forward_items} | "
             f"{bench.optional_float(row.proof_shared_backbone_ok_rate, 3)} | "
             f"{bench.optional_float(row.proof_batched_head_ok_rate, 3)} | "
             f"{row.fps_sustains_25} |"
         )
     lines.extend(["", "## v8 FPS Profile", ""])
     lines.append(
-        "| Sequence | Config | ReID Mode | N Target | Candidate transfer ms/update | Candidate decode ms/update | Feature-template ms/update | Fusion ms/update | ReID feature ms/update | Identity ms/update | Accept ms/update | Hold ms/update | Feature refresh ms/update | Debug/proof ms/update | Unbucketed ms/update |"
+        "| Sequence | Config | ReID Mode | N Target | Candidate transfer ms/update | Candidate decode ms/update | Feature-template ms/update | Fusion ms/update | Shared ROI ReID ms/update | DINOv2 crop ReID ms/update | Identity ms/update | Accept ms/update | Hold ms/update | Feature refresh ms/update | Debug/proof ms/update | Unbucketed ms/update |"
     )
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for row in timing_rows:
         identity_ms = None
         if row.profile_identity_resolve_ms_per_update is not None or row.profile_identity_score_ms_per_update is not None:
@@ -1949,6 +2522,7 @@ def write_summary_md(
             f"{bench.optional_float(row.profile_template_match_ms_per_update, 3)} | "
             f"{bench.optional_float(row.profile_candidate_fusion_ms_per_update, 3)} | "
             f"{bench.optional_float(row.profile_reid_appearance_ms_per_update, 3)} | "
+            f"{bench.optional_float(row.profile_dinov2_crop_reid_ms_per_update, 3)} | "
             f"{bench.optional_float(identity_ms, 3)} | "
             f"{bench.optional_float(row.profile_accept_ms_per_update, 3)} | "
             f"{bench.optional_float(row.profile_hold_ms_per_update, 3)} | "
@@ -2012,7 +2586,7 @@ def write_summary_md(
             )
     occlusion_summary = summarize_occlusion_survival(identity_rows)
     if occlusion_summary:
-        lines.extend(["", "## Occlusion Survival", ""])
+        lines.extend(["", "## Natural Occlusion Diagnostic", ""])
         lines.append("| Sequence | Config | ReID Mode | N Target | Tracker | Longest Observed Occlusion Frames | Longest Survived Occlusion Frames | Recovered After Gap | Lost After Gap | Final State |")
         lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for row in occlusion_summary:
@@ -2021,6 +2595,22 @@ def write_summary_md(
                 f"{row['tracker_id']} | {row['longest_occluded_frames_observed']} | "
                 f"{row['longest_occlusion_survived_frames']} | {row['recovered_after_gap']} | "
                 f"{row['lost_after_gap']} | {row['final_lifecycle_state']} |"
+            )
+    controlled_occlusion_summary = summarize_controlled_occlusion(controlled_occlusion_rows)
+    if controlled_occlusion_summary:
+        lines.extend(["", "## Controlled Occlusion Survival", ""])
+        lines.append(
+            "| Sequence | Config | ReID Mode | N Target | Forced Occlusion Frames | Trials | Valid Trials | Survival Rate | Recovery Rate | Identity Lost Rate | Mean Frames To Recover | Mean Post-IoU |"
+        )
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for row in controlled_occlusion_summary:
+            lines.append(
+                f"| {row['sequence']} | {row['lorat_config']} | {row['reid_mode']} | {row['target_tracks']} | "
+                f"{row['duration_frames']} | {row['trials']} | {row['valid_trials']} | "
+                f"{bench.optional_float(row['survival_rate'], 3)} | {bench.optional_float(row['recovery_rate'], 3)} | "
+                f"{bench.optional_float(row['identity_lost_rate'], 3)} | "
+                f"{bench.optional_float(row['mean_frames_to_recover'], 2)} | "
+                f"{bench.optional_float(row['mean_post_occlusion_iou'], 3)} |"
             )
     lines.extend(["", "## 25 FPS Capacity", ""])
     lines.append("| Sequence | Config | ReID Mode | GPU Profile | Max N Sustaining 25 FPS |")
@@ -2042,6 +2632,7 @@ def flush_outputs(
     area_observations: Sequence[bench.AreaObservation],
     full_area_observations: Sequence[bench.AreaObservation],
     identity_rows: Sequence[IdentityObservation],
+    controlled_occlusion_rows: Sequence[Dict[str, object]],
     proof_rows: Sequence[Dict[str, object]],
     candidate_rows: Sequence[Dict[str, object]],
     debug_rows: Sequence[Dict[str, object]],
@@ -2097,10 +2688,76 @@ def flush_outputs(
             "final_lifecycle_state",
         ],
     )
+    write_dict_rows_csv(
+        paths.controlled_occlusion_trials_csv,
+        controlled_occlusion_rows,
+        [
+            "sequence",
+            "lorat_config",
+            "execution_mode",
+            "reid_mode",
+            "target_tracks",
+            "duration_frames",
+            "trial_index",
+            "occluded_gt_id",
+            "occluded_tracker_id",
+            "occlusion_start_frame",
+            "occlusion_end_frame",
+            "recovery_start_frame",
+            "recovery_end_frame",
+            "pre_iou",
+            "pre_correct",
+            "valid_trial",
+            "recovered",
+            "survived",
+            "identity_lost",
+            "first_recovery_frame",
+            "frames_to_recover",
+            "post_mean_iou",
+            "post_iou50",
+            "identity_switch_after",
+            "track_lost_after",
+            "final_iou",
+            "final_state",
+            "rule",
+        ],
+    )
+    write_dict_rows_csv(
+        paths.controlled_occlusion_survival_csv,
+        summarize_controlled_occlusion(controlled_occlusion_rows),
+        [
+            "sequence",
+            "lorat_config",
+            "reid_mode",
+            "target_tracks",
+            "duration_frames",
+            "trials",
+            "valid_trials",
+            "survived_trials",
+            "recovered_trials",
+            "survival_rate",
+            "recovery_rate",
+            "identity_lost_rate",
+            "mean_frames_to_recover",
+            "mean_post_occlusion_iou",
+            "identity_switch_after_count",
+            "track_lost_after_count",
+        ],
+    )
     write_week2_proof_csv(paths.week2_proof_csv, proof_rows)
     write_candidate_diagnostics_csv(paths.candidate_diagnostics_csv, candidate_rows)
     write_debug_csv(paths.debug_csv, debug_rows)
-    write_summary_md(paths.summary_md, args, label, paths, timing_rows, area_rows, identity_rows, candidate_rows)
+    write_summary_md(
+        paths.summary_md,
+        args,
+        label,
+        paths,
+        timing_rows,
+        area_rows,
+        identity_rows,
+        candidate_rows,
+        controlled_occlusion_rows,
+    )
     return area_rows
 
 
@@ -2125,6 +2782,7 @@ def main() -> int:
     area_observations: List[bench.AreaObservation] = []
     full_area_observations: List[bench.AreaObservation] = []
     identity_rows: List[IdentityObservation] = []
+    controlled_occlusion_rows: List[Dict[str, object]] = []
     proof_rows: List[Dict[str, object]] = []
     candidate_rows: List[Dict[str, object]] = []
     debug_rows: List[Dict[str, object]] = []
@@ -2136,7 +2794,9 @@ def main() -> int:
     print(f"Sampled observations CSV: {paths.observations_csv}", flush=True)
     print(f"Identity CSV: {paths.identity_csv}", flush=True)
     print(f"Identity/ReID summary CSV: {paths.identity_summary_csv}", flush=True)
-    print(f"Occlusion survival CSV: {paths.occlusion_survival_csv}", flush=True)
+    print(f"Natural occlusion diagnostic CSV: {paths.occlusion_survival_csv}", flush=True)
+    print(f"Controlled occlusion trials CSV: {paths.controlled_occlusion_trials_csv}", flush=True)
+    print(f"Controlled occlusion survival CSV: {paths.controlled_occlusion_survival_csv}", flush=True)
     print(f"Week 2 proof CSV: {paths.week2_proof_csv}", flush=True)
     print(f"Candidate diagnostics CSV: {paths.candidate_diagnostics_csv}", flush=True)
     print(f"Debug CSV: {paths.debug_csv}", flush=True)
@@ -2148,6 +2808,11 @@ def main() -> int:
     print(f"Frames per run: {args.max_frames if args.max_frames > 0 else 'full sequence'}", flush=True)
     print(f"Area reliability sampling: every {args.area_sample_interval} frame(s)", flush=True)
     print(f"Identity/ReID sampling: every {args.identity_sample_interval} frame(s)", flush=True)
+    print(
+        "Controlled occlusion durations: "
+        f"{','.join(str(value) for value in parse_controlled_occlusion_durations(args)) or 'disabled'}",
+        flush=True,
+    )
 
     record_debug(
         debug_rows,
@@ -2170,6 +2835,7 @@ def main() -> int:
         area_observations,
         full_area_observations,
         identity_rows,
+        controlled_occlusion_rows,
         proof_rows,
         candidate_rows,
         debug_rows,
@@ -2190,6 +2856,7 @@ def main() -> int:
                             area_observations,
                             full_area_observations,
                             identity_rows,
+                            controlled_occlusion_rows,
                             proof_rows,
                             candidate_rows,
                             debug_rows,
@@ -2235,6 +2902,7 @@ def main() -> int:
                             area_observations,
                             full_area_observations,
                             identity_rows,
+                            controlled_occlusion_rows,
                             proof_rows,
                             candidate_rows,
                             debug_rows,
@@ -2250,6 +2918,7 @@ def main() -> int:
                             area_observations,
                             full_area_observations,
                             identity_rows,
+                            controlled_occlusion_rows,
                             proof_rows,
                             candidate_rows,
                             debug_rows,
@@ -2269,6 +2938,7 @@ def main() -> int:
                         area_observations,
                         full_area_observations,
                         identity_rows,
+                        controlled_occlusion_rows,
                         proof_rows,
                         candidate_rows,
                         debug_rows,
@@ -2277,11 +2947,16 @@ def main() -> int:
                         print("Stop requested; flushed partial v8 benchmark outputs and exiting cleanly.", flush=True)
                         return 0
 
-    record_debug(
-        debug_rows,
-        paths.debug_csv,
-        "run_complete",
-        reason=f"completed_cases={len(timing_rows)}; area_samples={len(area_observations)}; identity_samples={len(identity_rows)}",
+    controlled_occlusion_rows.extend(
+        run_controlled_occlusion_benchmark(
+            args,
+            sequences,
+            configs,
+            track_counts,
+            reid_modes,
+            debug_rows,
+            paths.debug_csv,
+        )
     )
     flush_outputs(
         args,
@@ -2292,6 +2967,34 @@ def main() -> int:
         area_observations,
         full_area_observations,
         identity_rows,
+        controlled_occlusion_rows,
+        proof_rows,
+        candidate_rows,
+        debug_rows,
+    )
+    if STOP_REQUESTED:
+        print("Stop requested; flushed partial controlled occlusion outputs and exiting cleanly.", flush=True)
+        return 0
+
+    record_debug(
+        debug_rows,
+        paths.debug_csv,
+        "run_complete",
+        reason=(
+            f"completed_cases={len(timing_rows)}; area_samples={len(area_observations)}; "
+            f"identity_samples={len(identity_rows)}; controlled_occlusion_trials={len(controlled_occlusion_rows)}"
+        ),
+    )
+    flush_outputs(
+        args,
+        paths,
+        label,
+        area_bins,
+        timing_rows,
+        area_observations,
+        full_area_observations,
+        identity_rows,
+        controlled_occlusion_rows,
         proof_rows,
         candidate_rows,
         debug_rows,
@@ -2303,6 +3006,8 @@ def main() -> int:
     print(f"  {paths.identity_csv}", flush=True)
     print(f"  {paths.identity_summary_csv}", flush=True)
     print(f"  {paths.occlusion_survival_csv}", flush=True)
+    print(f"  {paths.controlled_occlusion_trials_csv}", flush=True)
+    print(f"  {paths.controlled_occlusion_survival_csv}", flush=True)
     print(f"  {paths.week2_proof_csv}", flush=True)
     print(f"  {paths.candidate_diagnostics_csv}", flush=True)
     print(f"  {paths.debug_csv}", flush=True)

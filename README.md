@@ -1,62 +1,39 @@
 # MOT-LVW
 
-LoRAT-based multi-object tracking with a desktop OpenCV GUI.
+LoRaT-based multi-object tracking research code for selected-object video labeling.
 
-Project goal:
+The current development line is V9: a local-search tracker that keeps LoRaT as the single-object tracking backbone while adding multi-object coordination, re-identification/recovery logic, and a trainable selected-target head. V8 remains in the repo because V9 reuses its shared utilities, training data adapters, and model-head components.
 
-> Implement LoRAT for multi-object tracking on GPU/CUDA, exercise it on DanceTrack and MOT17, and provide a graphical interface where a user can place multiple bounding boxes and track all selected objects at the same time.
+## Current Working Set
 
-Learning guide:
+The files that matter for current development are:
 
-- Start with `docs/project_learning_guide.md` for the consolidated beginner-to-project study path covering Python/OpenCV basics, computer vision, SOT, MOT, SOT-based MOT, LoRAT/V8, training, benchmarks, and the summer deliverables.
+- `programs/bounding_box_v9_lorat_local_search.py` - current V9 tracker.
+- `programs/train_lorat_v9_local_search_head.py` - current V9 head trainer.
+- `programs/benchmark_lorat_v9.py` - current V9 benchmark entrypoint.
+- `programs/bounding_box_v9_lorat_open_world.py` - Week 4/open-world scaffold.
+- `programs/bounding_box_v8_lorat_quality_batched.py` - V8 tracker/head components reused by V9.
+- `programs/train_lorat_v8_head.py` - V8 dataset/training utilities reused by V9.
+- `programs/benchmark_lorat_v8.py` - V8 benchmark utilities reused by V9.
+- `programs/mot_common.py` - shared MOT/ReID/geometry helpers.
+- `programs/exercise_lorat_mot.py` - DanceTrack/MOT sequence helpers.
+- `programs/export_tao_to_mot_sequences.py` - TAO export/adapter helper.
 
-The current Git-facing deliverable is focused on three program files:
+Older V2-V7 scripts were useful research history, but they are not the active implementation and should not be treated as current entrypoints.
 
-- `programs/bounding_box_v3_lorat.py`: the LoRAT-backed multi-object GUI tracker.
-- `programs/bounding_box_v4_lorat_memory.py`: experimental v4 GUI tracker that gives each visible track multiple internal LoRAT memory slots.
-- `programs/exercise_lorat_mot.py`: the DanceTrack exercise/benchmark runner.
-- `programs/benchmark_lorat_mot.py`: the repeatable Week 1 timing and small-object benchmark runner.
+## Local-Only Assets
 
-Older OpenCV prototypes, local datasets, downloaded models, debug logs, generated videos, papers, and external repository snapshots are development artifacts and should stay local unless there is a specific reason to include them.
+Large data and model files are intentionally not tracked:
 
-## Local Layout
+- `data/raw/` - DanceTrack, MOT17, TAO-OW, LaSOT/GOT-style data.
+- `models/lorat/` - LoRaT checkpoint binaries.
+- `external/LoRAT-main/` - local LoRaT checkout.
+- `outputs/` - benchmark videos, logs, plots, and staging bundles.
+- `.venv/` - local virtual environment.
 
-Expected project layout:
+The `.gitignore` is set up to keep those local.
 
-```text
-MOT-LVW/
-  programs/
-    bounding_box_v3_lorat.py
-    bounding_box_v4_lorat_memory.py
-    exercise_lorat_mot.py
-    benchmark_lorat_mot.py
-  requirements.txt
-  README.md
-```
-
-Local-only folders used while running the project:
-
-```text
-data/                          DanceTrack/MOT17 data
-external/LoRAT-main/           Local LoRAT checkout
-models/lorat/                  LoRAT checkpoint files
-outputs/                       Result files, preview videos, debug logs
-papers/                        Reference PDFs
-.venv/                         Local Python environment
-```
-
-## Requirements
-
-- Python 3.10 or newer
-- OpenCV with GUI support
-- NumPy
-- SciPy
-- PyYAML
-- PyTorch
-- A local LoRAT checkout under `external/LoRAT-main`
-- LoRAT checkpoint files under `models/lorat`
-
-CPU works for development and short smoke tests. CUDA runs require an NVIDIA GPU and a CUDA-compatible PyTorch install. On Windows with AMD Radeon hardware, V4 can also use PyTorch DirectML with `--device dml`; this is useful for local iteration, but CUDA remains the target backend for NVIDIA benchmarking.
+## Environment
 
 Install project dependencies:
 
@@ -66,392 +43,85 @@ python -m venv .venv
 & ".\.venv\Scripts\python.exe" -m pip install -r requirements.txt
 ```
 
-Install PyTorch separately if needed. For CUDA, use the PyTorch wheel index that matches the target NVIDIA machine. For AMD/Windows DirectML:
+Install PyTorch separately for the target machine. For Theia/A100 training we use a CUDA PyTorch wheel inside the Slurm job.
 
-```powershell
-& ".\.venv\Scripts\python.exe" -m pip install torch-directml
-```
-
-## Run The GUI
-
-The main GUI script is:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py"
-```
-
-When run without arguments, it tries to open the local DanceTrack `dancetrack0065` sequence if the dataset exists.
-
-Run on a webcam:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --device cpu --video 0
-```
-
-Run on a video file:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --device cpu --video ".\path\to\video.mp4"
-```
-
-Run on a DanceTrack/MOT-style image sequence:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --device cpu --sequence ".\data\raw\DanceTrack\val\val\dancetrack0065"
-```
-
-Run on CUDA:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --device cuda:0 --sequence ".\data\raw\DanceTrack\val\val\dancetrack0065"
-```
-
-Run the experimental v4 LoRAT-memory GUI:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v4_lorat_memory.py" --device cuda:0 --sequence ".\data\raw\DanceTrack\val\val\dancetrack0065"
-```
-
-Run V4 on AMD/Windows DirectML:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v4_lorat_memory.py" --device dml --sequence ".\data\raw\DanceTrack\val\val\dancetrack0065"
-```
-
-DirectML is currently forced to `--track-batch-size 1` by V4 because batched DirectML LoRAT outputs were unstable on the local AMD setup. On CUDA, use a larger `--track-batch-size` such as `16` or `32` to improve GPU utilization.
-
-V4 preserves v3 and changes the control flow: each selected object owns its own LoRAT tracker bank, then a lightweight identity-memory layer decides which LoRAT output still belongs to that track. The default `--lorat-memory-slots 11` means one permanent first-frame LoRAT anchor plus ten rolling recent LoRAT template slots per selected box. For performance, V4 now evaluates only `--lorat-active-slots-per-track 3` slots per track per frame by default. Use `--lorat-memory-slots 1` when you want the older one-LoRAT-task-per-box behavior, or `--lorat-active-slots-per-track 0` when you intentionally want to evaluate the full memory bank every frame.
-
-V4 also tightens LoRAT's own single-object setup by default: `--lorat-search-area-factor 3.0` narrows the search crop so nearby lookalikes are less likely to enter the search region, and `--lorat-window-penalty 0.60` increases LoRAT's bias toward staying near the current target. To compare against upstream LoRAT defaults, use `--lorat-search-area-factor 4.0 --lorat-window-penalty 0.45` for 224 configs, or `--lorat-search-area-factor 5.0 --lorat-window-penalty 0.45` for 378 configs.
-
-V4 also passes conservative state-update thresholds into LoRAT's one-stream pipeline. When a prediction has low score, jumps too far, or changes box area too much, LoRAT still reports the prediction to V4, but LoRAT does not immediately move its internal search/crop state to that suspicious box.
-
-V4 now adds a stricter identity safety layer around each single-object LoRAT tracker. Hungarian assignment is still used across all active LoRAT slot outputs, but the default ReID and motion gates are higher: `--identity-min-score 0.50`, `--identity-min-reid 0.28`, and `--identity-min-motion 0.18`. A LoRAT box also needs `--lorat-accept-min-score 0.20` before it can update the visible track. Lower-confidence outputs are treated as temporary occlusions, held with a per-track Kalman filter for up to `--occlusion-max-frames 30`, and are not allowed to refresh LoRAT memory or contaminate the ReID bank. During occlusion, `--occlusion-velocity-damping 0.65` slows the Kalman velocity each held frame so the box does not coast hundreds of pixels away from the last reliable target.
-
-LoRAT's raw response score is not treated as a universal probability in V4. Each track now calibrates confidence against its own first healthy LoRAT response, so the displayed/debug `confidence` is relative to that target's normal LoRAT score. The CSV also includes `raw_confidence` and `confidence_baseline` so you can see when LoRAT's absolute score is low even though the relative track confidence is healthy.
-
-V4 also has a pose/view-change bridge for targets whose visible appearance genuinely changes, such as a face/front-torso crop becoming the back of a head or torso. If the output comes from the same LoRAT-owned slot and motion is smooth enough, `--view-change-min-motion 0.72` and `--view-change-min-confidence 0.16` allow the update even when ReID temporarily disagrees. Those updates are tagged `VIEWCHANGE` and can refresh rolling LoRAT memory so the tracker learns the new view without replacing the first-frame anchor.
-
-V4 also keeps a reliable center-path vector for each track. Only trusted, non-occluded updates are added to this path, so held Kalman frames cannot drag the guide away. Candidate boxes are scored against that recent direction of travel, and `--identity-min-path 0.40` rejects lower-confidence crossing candidates that jump off the target's expected centerline. When the reliable center path is mostly stationary, V4 switches from directional velocity scoring to a tighter local-center radius, which helps when the selected person is standing or moving toward the camera while a similar person passes behind them.
-
-V4 now lets LoRAT scale boxes again, but clamps scaling aggressively. The default `--lorat-min-box-area 100` prevents accepted boxes and LoRAT's internal one-stream state from shrinking below 100 pixels of area, `--lorat-trusted-size-floor-scale 0.70` prevents width/height from dropping below 70 percent of the initial selected box, and `--lorat-max-area-change-per-frame 1.05` limits frame-to-frame area changes. Use `--fixed-lorat-box-size` only when you want to preserve the initial selected width/height exactly.
-
-GUI controls:
-
-- Draw a box with the mouse.
-- Press `Enter` or `Space` to accept the current box.
-- Press `c` to cancel the current box selection.
-- Press `a` during playback to add a new box when an object becomes visible.
-- Press `q` during playback to quit.
-
-There is no default maximum number of selected boxes. Use `--max-tracks N` only when you intentionally want a cap. `--track-batch-size` controls how many LoRAT tasks are processed together internally.
-
-## Exercise DanceTrack
-
-The exercise script runs the v3 tracker on DanceTrack-style sequences and writes MOTChallenge-format result files.
-
-List available sequences:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --list-sequences
-```
-
-Run DanceTrack 0065 with manual GUI initialization:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --device cpu --sequence dancetrack0065
-```
-
-Run a short CPU smoke test:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --device cpu --sequence dancetrack0065 --max-frames 50
-```
-
-Use ground-truth initialization for repeatable tests:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --device cpu --sequence dancetrack0065 --gt-init --max-frames 50
-```
-
-Run on CUDA:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --device cuda:0 --sequence dancetrack0065
-```
-
-Preview videos are enabled by default in the exercise runner. Add `--no-save-video` for faster smoke tests.
-
-## Model Config Comparison
-
-The v3 runner supports multiple LoRAT model configs:
-
-- `B-224`
-- `B-378`
-- `L-224`
-- `L-378`
-- `g-224`
-- `g-378`
-
-Compare several configs on the same sequence:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --compare-configs B-224 L-224 g-224 --gt-init --device cuda:0 --sequence dancetrack0065 --min-init-tracks 4 --max-frames 150
-```
-
-For CPU development, keep comparisons short:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --compare-configs B-224 B-378 --gt-init --device cpu --sequence dancetrack0065 --min-init-tracks 4 --max-frames 3 --no-save-video
-```
-
-Comparison CSV and Markdown summaries are written under `outputs/lorat-exercise/dancetrack/.../comparison`.
-
-## Week 1 Benchmarks
-
-Use the dedicated benchmark script for items (b) and (c):
-
-- timing required to produce boxes for one object, two objects, and up to N objects per video
-- smallest ground-truth pixel-area bins that remain reliable
-
-Run the default benchmark on DanceTrack 0065 for 200 frames:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_mot.py" --device cpu
-```
-
-The default benchmark uses `B-224`, `dancetrack0065`, `--track-counts 1,2,4,8`, and `--max-frames 200`.
-
-Run the same 200-frame benchmark on CUDA:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_mot.py" --device cuda:0
-```
-
-Compare model sizes against the same benchmark:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_mot.py" --device cuda:0 --compare-configs B-224 L-224 g-224
-```
-
-Write per-frame/per-track area observations for deeper analysis:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_mot.py" --device cpu --write-observations
-```
-
-Observation CSVs and annotated preview videos are enabled by default. Use `--no-write-observations` or `--no-save-video` only when you want a lighter run.
-
-The benchmark prints the output folder, CSV paths, video folder, active config, track count, and frame progress in the VS Code terminal. By default it prints progress every 10 processed frames:
+Expected local layout:
 
 ```text
-[dancetrack0065 B-224 N=4] frame 70/200 (source frame 70), elapsed 123.4s
+MOT-LVW/
+  programs/
+  scripts/
+  docs/
+  requirements.txt
+  README.md
+
+Local-only:
+  data/raw/
+  external/LoRAT-main/
+  models/lorat/
+  outputs/
 ```
 
-Adjust the status interval with `--progress-interval`:
+## V9 Training
+
+V9 training mixes MOT-style data and SOT-style selected-target data:
+
+- DanceTrack/MOT17 for multi-object identity/conflict supervision.
+- TAO-OW for open-world object diversity.
+- LaSOT/GOT-style SOT sequences for selected-target template/search behavior, including small/part-like targets.
+
+Local smoke checks:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_mot.py" --device cpu --progress-interval 5
+python -m py_compile programs\train_lorat_v9_local_search_head.py programs\bounding_box_v9_lorat_local_search.py programs\benchmark_lorat_v9.py
+python programs\train_lorat_v9_local_search_head.py --smoke-targets
 ```
 
-Benchmark outputs are written under `outputs/lorat-benchmarks/dancetrack` by default:
-
-- `{run_label}_timing_by_track_count.csv`
-- `{run_label}_area_reliability.csv`
-- `{run_label}_area_observations.csv`
-- `{run_label}_summary.md`
-- `videos/*.mp4`
-
-Each benchmark run gets a unique folder and filename prefix such as `dancetrack0065_B-224_N1-2-4-8_frames200_20260529_143000`, so new runs do not overwrite older output and the config plus number of selected tracks are visible in the saved artifacts.
-
-The timing CSV records total seconds, initialization seconds, tracking seconds, FPS, total milliseconds per produced box, tracking-only milliseconds per produced box, and the preview-video path. The area CSV groups each GT-matched tracker observation by ground-truth bounding-box pixel area and reports mean IoU, IoU@0.50, unreliable rate, and whether the bin meets the configured reliability rule.
-
-For the Week 2 V5 tracker, use the V5 benchmark runner:
+Submit the current B-224 V9 48-hour Theia training job:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_v5.py" --device cuda:0 --max-track-count 8 --compare-configs B-224 L-224 g-224
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\submit_theia_v9_b224_tao_48h.ps1
 ```
 
-`--max-track-count 8` runs 1 through 8 objects per video. You can still use sparse counts with `--track-counts 1,2,4,8`. By default, `benchmark_lorat_v5.py` compares:
+That script uploads current V9/V8 code, uploads `data/raw/LaSOT_subset` as `LaSOT_subset.tar.gz`, and submits:
 
-- `v4-serial-baseline`: the before-refactor baseline, using the V4 tracker with `track_batch_size=1` inside the benchmark runner.
-- `v5-shared`: the V5 tracker, which replaces the old mixed path with shared batched LoRAT inference.
+```text
+scripts/theia_v9_train_b224_48h_tao.sbatch
+```
 
-For a lab GPU run:
+The Slurm job extracts LaSOT inside the GPU allocation if `/work/landonvw/LaSOT_subset` is not already present.
+
+## V9 Benchmarking
+
+Use:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_v5.py" --device cuda:0 --gpu-profile lab --max-track-count 16 --compare-configs B-224 L-224 --track-batch-size 16 --no-save-video
+python programs\benchmark_lorat_v9.py --help
 ```
 
-For an HPC GPU run:
+Benchmark runs should save:
+
+- machine-readable CSV/JSON summaries,
+- videos for qualitative proof,
+- debug/proof fields for identity switches, track loss, re-acquisition, confidence, IoU, and small-target behavior.
+
+## Dataset Helpers
+
+TAO-OW subset download/export:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_v5.py" --device cuda:0 --gpu-profile hpc --max-track-count 32 --compare-configs B-224 L-224 --track-batch-size 32 --no-save-video
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\download_tao_ow_subset.ps1
+python programs\export_tao_to_mot_sequences.py --help
 ```
 
-V5 benchmark outputs go under `outputs/lorat-benchmarks/v5-dancetrack` by default and include timing, area-reliability, observations, summary, preview-video files, and `model_comparison.csv`. The timing CSV includes `execution_mode`, `gpu_profile`, `gpu_name`, peak GPU memory, max evaluator batch, evaluator call counts when available, and whether the run sustained the default `--fps-threshold 25`.
-
-The observations CSV now performs the concrete object-correctness benchmark every `--identity-sample-interval 10` frames. A sampled row reports:
-
-- `correct_object`: true when the track still overlaps its initialized GT object with IoU at least `--identity-correct-iou 0.30` and no other visible GT object beats it by more than `--identity-competitor-margin 0.05`.
-- `identity_jump`: true when sampled center movement exceeds `--identity-jump-factor 2.0` times the current GT diagonal.
-- `occluded`: true when the V4 state marks an occlusion, miss, low-confidence hold, uncertain ID, or lost track.
-
-The Markdown summary reports before/after FPS speedup, GPU memory by object count, the maximum N sustaining at least 25 FPS for each `--gpu-profile`, and sampled object-correctness/jump/occlusion rates. Run the same command once on the lab GPU and once on the HPC GPU with matching track counts to fill both capacity rows with concrete values.
-
-## V3 Behavior
-
-The v3 tracker adapts LoRAT, which is normally single-object tracking, into a multi-object workflow:
-
-- One LoRAT task is created per user-selected bounding box.
-- All LoRAT proposals are passed through a shared coordinator.
-- The coordinator uses object-agnostic color/texture ReID features.
-- SciPy Hungarian assignment matches proposals back to track IDs.
-- Each track stores the initial appearance and a conservative rolling appearance bank.
-- Each track stores the first visual template and a rolling 10-frame visual memory bank.
-- Visual memory is kept for ReID/coordinator reasoning, but it is not used to reset LoRAT every frame.
-- When a LoRAT proposal looks like an ID jump, the coordinator can add a `memory` recovery candidate near the predicted track location by comparing local crops against the first-frame and rolling memory examples.
-- The coordinator uses trajectory, direction, bottom-edge, overlap, and size guards to reduce ID jumps during close crossings.
-- If LoRAT loses a track, coasting preserves the box size instead of letting width/height shrink every frame.
-- A trusted size floor prevents a track box from collapsing too small to recover.
-- In V4, box scaling is allowed by default but constrained with a minimum area and per-frame area-change limit.
-
-## Experimental V4 Behavior
-
-The v4 tracker is a LoRAT-led MOT engine. Previous behavior remains in v3, while v4 keeps the active tracking path focused on LoRAT-owned track tasks:
-
-V4 tuning defaults live near the top of `programs/bounding_box_v4_lorat_memory.py` in the `DEFAULT_*` block. The VS Code V4 launch profile only passes device/model/sequence, so editing that block changes normal Run and Debug behavior unless you explicitly pass a CLI override.
-
-- Each user-selected box creates one permanent initial LoRAT tracker task plus rolling recent LoRAT memory tasks by default.
-- LoRAT still proposes boxes from each owned tracker task, but V4 now uses a small ReID/Hungarian identity pass to decide which visible track each proposal best belongs to.
-- If a proposal looks more like another tracked object, the output can be assigned back to that object's track ID instead of silently swapping identities.
-- If LoRAT misses or produces an untrusted low-confidence box, V4 holds the track with a per-track Kalman prediction for up to `--occlusion-max-frames` frames while keeping the LoRAT task alive for recovery.
-- `--lorat-memory-slots` controls the first-frame-plus-recent LoRAT memory bank. The default `11` is the 10+1 setup; each recent slot is only refreshed after a trusted identity match, so suspicious overlap frames do not overwrite every memory at once.
-- `--lorat-memory-refresh-interval` controls how often the rolling recent LoRAT slots are refreshed. The default `1` keeps the ten recent slots frame-by-frame; higher values spread the memory across a longer time window.
-- `--lorat-active-slots-per-track` controls how many memory slots are actually evaluated each frame. The default is currently `10`, which evaluates almost the full 10+1 memory bank; `0` restores full-bank evaluation.
-- `--lorat-min-box-area` controls the hard lower area clamp. The default `100` prevents boxes from collapsing below 100 pixels.
-- `--lorat-max-area-change-per-frame` controls how quickly boxes can scale. The default `1.05` allows about 5 percent area growth/shrink per accepted frame.
-- `--lorat-trusted-size-floor-scale` prevents width/height from shrinking below a fraction of the initial selected box. The default is `0.70`.
-- `--fixed-lorat-box-size` preserves the initial selected width/height exactly.
-- `--lorat-search-area-factor` and `--lorat-window-penalty` override LoRAT's runtime config before the evaluator is built, making V4's single-object LoRAT tasks more conservative around similar nearby objects.
-- `--lorat-state-update-min-score`, `--lorat-state-update-max-center-shift`, and `--lorat-state-update-max-area-change` control whether LoRAT is allowed to update its own internal search/crop state after a prediction.
-- `--lorat-accept-min-score` controls whether a LoRAT output is trusted enough to update the visible track; lower scores become Kalman-held occlusion frames instead.
-- `--disable-identity-arbitration`, `--identity-min-score`, `--identity-min-reid`, `--identity-min-motion`, `--identity-min-path`, `--identity-bank-size`, and `--identity-memory-min-confidence` tune the lightweight identity layer.
-- `--occlusion-max-frames` controls how long an untrusted target is kept alive by Kalman prediction. `--occlusion-iou-threshold` skips memory refresh while a track overlaps another active track, and `--occlusion-velocity-damping` slows the held prediction over time.
-- `--reid-recovery-min-score`, `--reid-recovery-min-reid`, `--reid-recovery-min-motion`, and `--reid-recovery-min-confidence` allow a low-confidence LoRAT box to recover a lost track only when appearance and motion are both strong.
-- `--view-change-min-score`, `--view-change-min-motion`, `--view-change-min-confidence`, and `--view-change-max-lost-frames` tune same-target pose/view adaptation when a selected face or torso changes appearance as the person turns.
-- `--track-batch-size` controls how many LoRAT tasks run per forward chunk; `--lorat-slot-capacity` controls the maximum internal LoRAT task cache size.
-
-## V5 Shared-Backbone Tracker
-
-The V5 tracker lives in `programs/bounding_box_v5_lorat_shared.py`. It starts from V4's identity, occlusion, and LoRAT-memory logic, but removes the old serial/shared switch from the tracker itself. Active LoRAT tasks are always grouped into GPU batches using `--track-batch-size`.
-V5 instruments the LoRAT forward path to report `model_forward_calls`, `max_model_forward_batch`, `fusion_forward_calls`, and `max_fusion_forward_batch` in `timing_by_track_count.csv` and `model_comparison.csv`. Static inspection plus the smoke run show that LoRAT's one-stream evaluator stacks per-object template/search crops and calls the model once per V5 chunk; `LoRAT_DINOv2._fusion` then runs the transformer blocks once over that batch. This confirms batched model/backbone execution, not merely evaluator-level batching.
-
-One wording caveat: the current LoRAT inference path does not maintain separate per-object LoRA heads. LoRA weights are merged into the shared model when the optimized inference model is loaded, so the accurate claim is "batched shared LoRAT/ViT forward over per-object crops" rather than "per-object LoRA heads."
-The V5 default `--lorat-min-box-area` is `1`, keeping the hard accepted-box floor as small as possible while still preventing a zero-area box; pass `0` to disable the floor entirely. V5 also lowers `--lorat-trusted-size-floor-scale` to `0.30`, so the geometric floor no longer prevents legitimate small-object boxes.
-
-V5 handles shrinking boxes primarily by holding learning, not by forcing the output box large:
-
-- `--shrink-guard-window 6` compares the current accepted box area against the recent maximum area.
-- `--shrink-guard-area-ratio 0.72` marks cumulative shrink risk when area falls below 72 percent of that recent maximum.
-- `--shrink-guard-step-ratio 0.94` marks a single-frame shrink risk when area falls below 94 percent of the previous accepted area.
-- Shrink-risk boxes can still update the visible track, but they refresh LoRAT/ReID/size memory only when calibrated confidence is at least `--shrink-guard-min-confidence 0.70` and, when appearance memory exists, ReID is at least `--shrink-guard-min-reid 0.50`.
-- `--crop-information-min-score 0.12` holds learning from accepted boxes whose crop is too visually weak. The score uses crop pixel count, edge density, Laplacian texture variance, and grayscale contrast; `--crop-information-min-pixels 64` is where tiny-crop penalty stops.
-
-Run the V5 GUI:
+LaSOT subset download:
 
 ```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v5_lorat_shared.py" --device cuda:0 --sequence ".\data\raw\DanceTrack\val\val\dancetrack0065" --track-batch-size 16
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\download_lasot_subset.ps1
 ```
 
-The live GUI overlay now reports smoothed FPS, active object count, CUDA allocated/reserved memory, peak reserved memory, execution mode, evaluator call count, maximum evaluator batch size, model forward count, maximum model-forward batch, and maximum fusion-forward batch. CUDA memory is shown only when PyTorch exposes CUDA memory counters; CPU and DirectML runs display `GPU n/a`.
+The current local LaSOT subset is hand-class only, used as an initial SOT-style selected-target training source.
 
-The GUI/debug overlay may show state tags:
+## Notes
 
-- `LORAT`: track was updated directly from its owned LoRAT output.
-- `LORAT-RECENT-01` through `LORAT-RECENT-10`: a rolling recent LoRAT memory slot produced the selected update.
-- `FIXEDSIZE`: V4 accepted LoRAT's center but preserved the initial selected width/height.
-- `MINAREA`: V4 expanded a box because its area fell below `--lorat-min-box-area`.
-- `SCALELIMIT`: V4 limited the accepted frame-to-frame area change.
-- `SIZEFLOOR`: V4 accepted LoRAT's center but expanded a collapsing width/height using trusted size memory.
-- `NOLEARN`: V5 accepted the visible box but did not refresh LoRAT template memory, ReID memory, trusted size memory, or last-reliable state from that crop.
-- `SHRINKRISK`: V5 held learning because the box was shrinking without enough confidence/ReID evidence.
-- `LOWINFO`: V5 held learning because the crop did not have enough visual information to trust as a new template.
-- `REID-LORAT`: a LoRAT proposal from another owned task was matched back to this track by the identity layer.
-- `ID_UNCERTAIN`: LoRAT produced a box, but the identity layer did not trust it enough to write it as this track.
-- `LOWCONF`, `REIDLOW`, `MOTIONLOW`, `PATHLOW`, or `REACQUIRE_LOWCONF`: LoRAT produced a box, but V4 held the Kalman prediction instead of committing the suspicious output.
-- `REIDRECOVERY`: V4 accepted a low-confidence LoRAT box because ReID and motion were strong enough to recover from occlusion.
-- `VIEWCHANGE`: V4 accepted a same-LoRAT-slot update with smooth motion even though appearance changed enough that ordinary ReID would have been suspicious.
-- `OCCLUDED`: V4 is holding or carefully accepting a track during a suspected occlusion; memory refresh is blocked.
-- `LORAT_MISS`: LoRAT did not produce an output for that track on this frame.
-
-## Debug Logs
-
-Write a focused debug CSV when diagnosing a jump:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --device cpu --sequence dancetrack0065 --debug-log ".\outputs\debug\dancetrack0065_frames60_85.csv" --debug-frame-start 60 --debug-frame-end 85
-```
-
-The debug CSV includes:
-
-- final LoRAT-owned box
-- raw LoRAT proposal
-- predicted box
-- calibrated confidence, raw LoRAT confidence, and the per-track confidence baseline
-
-Quick threshold tuning from a V4 debug CSV:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\tune_lorat_v4_debug.py" ".\outputs\debug\dancetrack0065_lorat_v4_debug.csv" --emit-cli
-```
-
-This reports state counts, score distributions, suspicious accepted jumps, occlusion streaks, and a small trial CLI block. It is meant for fast local iteration, not formal evaluation.
-- width, height, and area in pixels
-- velocity
-- assignment score, assignment margin, ReID score, motion score, and source score
-- state tags
-- lost frame count
-- active LoRAT slot, LoRAT memory slot count, and appearance-bank size
-
-The debug log is flushed while the program runs, so pressing `q` should still leave the completed rows on disk.
-
-## Important Notes
-
-LoRAT is not being trained by `exercise_lorat_mot.py`. The phrase "exercised on DanceTrack and MOT17" means the tracker is run and evaluated/tested on those datasets. Fine-tuning LoRAT on DanceTrack or MOT17 would be a separate training pipeline.
-
-DanceTrack is the current local test target. MOT17 support is wired as a dataset option, but final MOT17 runs require the MOT17 data to be present locally.
-
-Formal HOTA/MOTA/IDF1 evaluation is not fully wired yet. Current outputs are MOTChallenge-format files and preview/debug artifacts that can be connected to TrackEval later.
-
-## Useful Commands
-
-Show GUI options:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v3_lorat.py" --help
-```
-
-Show experimental v4 GUI options:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\bounding_box_v4_lorat_memory.py" --help
-```
-
-Show exercise runner options:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\exercise_lorat_mot.py" --help
-```
-
-Show benchmark runner options:
-
-```powershell
-& ".\.venv\Scripts\python.exe" ".\programs\benchmark_lorat_mot.py" --help
-```
-
-Check that the main scripts compile:
-
-```powershell
-& ".\.venv\Scripts\python.exe" -m py_compile ".\programs\bounding_box_v3_lorat.py" ".\programs\bounding_box_v4_lorat_memory.py" ".\programs\exercise_lorat_mot.py" ".\programs\benchmark_lorat_mot.py"
-```
+The project direction is no longer to keep every numbered prototype in GitHub. The repo should show the active research system and the code needed to reproduce current training/benchmark work. Historical generated outputs, old staging bundles, and retired prototypes should stay local unless a paper appendix explicitly needs them.

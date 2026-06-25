@@ -32,6 +32,22 @@ Submit with Slurm only:
 sbatch /work/$USER/theia_v8_week3_benchmark.sbatch
 ```
 
+From the local Windows project folder, the ready-to-use submit helper is:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\submit_theia_v8_week3_benchmark.ps1 `
+  -HeadWeightsRoot /work/landonvw/<training-result-folder>/checkpoints `
+  -HeadCheckpoint best `
+  -ResultRoot /work/landonvw/lorat-v8-week3-results-<label> `
+  -Sequences dancetrack0065 `
+  -TrackCounts 1,2,3,4,5 `
+  -CompareConfigs B-224
+```
+
+If `-HeadWeightsRoot` is omitted, the Theia wrapper searches the newest
+`/work/$USER/lorat-v8-train-results*/checkpoints` folder that contains the requested config.
+For paper comparisons, prefer setting it explicitly so the checkpoint source is unambiguous.
+
 Useful overrides:
 
 ```bash
@@ -62,6 +78,29 @@ Every run writes a timestamped folder under the output root.
 - `area_observations_every_frame.csv`: every-frame visible GT area/IoU observations for cross-checking Week 1/Week 3 failure frames.
 - `debug_log.csv`: case-level failures and benchmark progress state.
 - `videos/`: annotated videos when `--save-video` is used.
+
+## Comparing Downloaded Runs
+
+After downloading one or more benchmark result folders or zips, create compact comparison tables with:
+
+```powershell
+python programs\summarize_v8_benchmark_runs.py `
+  C:\Users\lando\Downloads\<week3-result-folder-or-zip> `
+  --output-dir outputs\benchmarks\v8_comparison_latest
+```
+
+To scan recent V8/Week 3 zips in Downloads automatically:
+
+```powershell
+python programs\summarize_v8_benchmark_runs.py --downloads --output-dir outputs\benchmarks\v8_comparison_latest
+```
+
+Outputs:
+
+- `comparison_summary.md`: presentation-friendly summary tables.
+- `comparison_timing_identity.csv`: FPS, IoU, correct-rate, loss-rate, identity switches, shared-backbone proof, and major profile buckets.
+- `comparison_controlled_occlusion.csv`: controlled occlusion duration/recovery rows when present.
+- `comparison_area_reliability.csv`: Week 1 small-area reliability rows when present.
 
 ## Metric Rules
 
