@@ -4,6 +4,7 @@ import argparse
 import copy
 import csv
 import io
+import math
 import signal
 import statistics
 import time
@@ -16,7 +17,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import cv2
 
 import benchmark_lorat_mot as bench
-import bounding_box_v8_lorat_quality_batched as v8
+import bounding_box_v9_runtime_base as v8
 import exercise_lorat_mot as exercise
 import mot_common as mot
 
@@ -148,6 +149,7 @@ class V8OutputPaths:
     full_observations_csv: Path
     identity_csv: Path
     identity_summary_csv: Path
+    mot_metrics_csv: Path
     occlusion_survival_csv: Path
     controlled_occlusion_trials_csv: Path
     controlled_occlusion_survival_csv: Path
@@ -168,7 +170,7 @@ def request_stop(signum, frame) -> None:  # type: ignore[no-untyped-def]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "v8-only LoRAT benchmark for Week 1/2/3 metrics: bounding-box timing, "
+            "V9-owned LoRAT-MOT benchmark harness for timing, "
             "small-object area reliability, FPS/memory scaling, shared-frame ViT proof, "
             "ReID ablation, identity switches, track loss, and controlled occlusion survival."
         )
@@ -289,7 +291,7 @@ def parse_args() -> argparse.Namespace:
         "--compare-configs",
         nargs="+",
         choices=tuple(mot.LORAT_WEIGHT_BY_CONFIG) + ("all",),
-        help="Run one or more LoRAT configs under v8. Use all to include B/L/g and 224/378.",
+        help="Run one or more LoRAT configs. Use all to include B/L/g and 224/378.",
     )
     parser.add_argument("--weight-path", type=Path)
     parser.add_argument("--device", default="cpu")
@@ -305,8 +307,8 @@ def parse_args() -> argparse.Namespace:
         "--v8-head-weights-root",
         type=Path,
         help=(
-            "Directory containing per-config trained V8 heads, e.g. "
-            "B_224/v8_head_B_224_best_by_val_iou.pt or B_224/v8_head_B_224_latest.pt."
+            "Directory containing per-config trained head checkpoints. "
+            "V9's front-end resolves v9_local_head_* files while keeping this legacy option name."
         ),
     )
     parser.add_argument(
@@ -653,6 +655,7 @@ def default_output_paths(args: argparse.Namespace, label: str) -> V8OutputPaths:
     )
     identity_csv = bench.unique_path(args.identity_csv.resolve() if args.identity_csv else run_root / "identity_observations_sampled.csv")
     identity_summary_csv = bench.unique_path(run_root / "identity_recovery_summary.csv")
+    mot_metrics_csv = bench.unique_path(run_root / "mot_paper_metrics_summary.csv")
     occlusion_survival_csv = bench.unique_path(run_root / "occlusion_survival.csv")
     controlled_occlusion_trials_csv = bench.unique_path(run_root / "controlled_occlusion_trials.csv")
     controlled_occlusion_survival_csv = bench.unique_path(run_root / "controlled_occlusion_survival.csv")
@@ -671,6 +674,7 @@ def default_output_paths(args: argparse.Namespace, label: str) -> V8OutputPaths:
         full_observations_csv,
         identity_csv,
         identity_summary_csv,
+        mot_metrics_csv,
         occlusion_survival_csv,
         controlled_occlusion_trials_csv,
         controlled_occlusion_survival_csv,
@@ -688,6 +692,7 @@ def default_output_paths(args: argparse.Namespace, label: str) -> V8OutputPaths:
         full_observations_csv=full_observations_csv,
         identity_csv=identity_csv,
         identity_summary_csv=identity_summary_csv,
+        mot_metrics_csv=mot_metrics_csv,
         occlusion_survival_csv=occlusion_survival_csv,
         controlled_occlusion_trials_csv=controlled_occlusion_trials_csv,
         controlled_occlusion_survival_csv=controlled_occlusion_survival_csv,
@@ -990,6 +995,7 @@ def collect_sampled_observations(
     sequence: str,
     lorat_config: str,
     reid_mode: str,
+    v9_diagnostic_mode: str,
     target_tracks: int,
     actual_tracks: int,
     init_frame: int,
@@ -1089,7 +1095,7 @@ def collect_sampled_observations(
                     lorat_config=lorat_config,
                     execution_mode=EXECUTION_MODE,
                     reid_mode=reid_mode,
-                    v9_diagnostic_mode=str(getattr(args, "v9_diagnostic_mode", "normal") or "normal"),
+                    v9_diagnostic_mode=v9_diagnostic_mode,
                     target_tracks=target_tracks,
                     actual_tracks=actual_tracks,
                     init_frame=init_frame,
@@ -1993,6 +1999,143 @@ def collect_candidate_diagnostics(
 
 
 def summarize_identity(identity_rows: Sequence[IdentityObservation]) -> List[Dict[str, object]]:
+    def selected_target_ok(row: IdentityObservation) -> bool:
+        return row.correct_object and not row.track_lost and not row.identity_switch
+
+    def steady_tracking_stats(rows: Sequence[IdentityObservation]) -> Dict[str, object]:
+        by_tracker: Dict[int, List[IdentityObservation]] = {}
+        for row in rows:
+            by_tracker.setdefault(row.tracker_id, []).append(row)
+
+        per_tracker: List[Dict[str, object]] = []
+        for tracker_rows in by_tracker.values():
+            visible_rows = sorted((row for row in tracker_rows if row.gt_visible), key=lambda row: (row.frame, row.sample_offset))
+            if not visible_rows:
+                continue
+
+            frames_until_failure = 0
+            first_failure_seen = False
+            current_correct = 0
+            longest_correct = 0
+            correct_visible_frames = 0
+            for row in visible_rows:
+                if selected_target_ok(row):
+                    correct_visible_frames += 1
+                    current_correct += 1
+                    longest_correct = max(longest_correct, current_correct)
+                    if not first_failure_seen:
+                        frames_until_failure += 1
+                else:
+                    current_correct = 0
+                    first_failure_seen = True
+            per_tracker.append(
+                {
+                    "visible_frames": len(visible_rows),
+                    "correct_visible_frames": correct_visible_frames,
+                    "frames_until_failure": frames_until_failure,
+                    "longest_correct_run": longest_correct,
+                    "survived_span": int(not first_failure_seen),
+                }
+            )
+
+        if not per_tracker:
+            return {
+                "steady_tracker_count": 0,
+                "steady_mean_frames_until_failure": None,
+                "steady_min_frames_until_failure": None,
+                "steady_max_frames_until_failure": None,
+                "steady_mean_longest_correct_run": None,
+                "steady_min_longest_correct_run": None,
+                "steady_max_longest_correct_run": None,
+                "steady_survived_span_rate": None,
+            }
+
+        frames_until = [int(row["frames_until_failure"]) for row in per_tracker]
+        longest_runs = [int(row["longest_correct_run"]) for row in per_tracker]
+        return {
+            "steady_tracker_count": len(per_tracker),
+            "steady_mean_frames_until_failure": statistics.fmean(frames_until),
+            "steady_min_frames_until_failure": min(frames_until),
+            "steady_max_frames_until_failure": max(frames_until),
+            "steady_mean_longest_correct_run": statistics.fmean(longest_runs),
+            "steady_min_longest_correct_run": min(longest_runs),
+            "steady_max_longest_correct_run": max(longest_runs),
+            "steady_survived_span_rate": statistics.fmean(int(row["survived_span"]) for row in per_tracker),
+        }
+
+    def single_object_survival_stats(rows: Sequence[IdentityObservation]) -> Dict[str, object]:
+        if not rows:
+            return {}
+        by_tracker: Dict[int, List[IdentityObservation]] = {}
+        for row in rows:
+            by_tracker.setdefault(row.tracker_id, []).append(row)
+        tracker_rows = max(
+            by_tracker.values(),
+            key=lambda group: (sum(1 for row in group if row.gt_visible), len(group)),
+        )
+        visible_rows = sorted((row for row in tracker_rows if row.gt_visible), key=lambda row: (row.frame, row.sample_offset))
+        if not visible_rows:
+            return {
+                "single_object_visible_frames": 0,
+                "single_object_correct_visible_frames": 0,
+                "single_object_frames_until_first_failure": None,
+                "single_object_first_failure_frame": None,
+                "single_object_first_failure_offset": None,
+                "single_object_first_failure_reason": "",
+                "single_object_longest_correct_run": 0,
+                "single_object_longest_failure_run": 0,
+                "single_object_survived_visible_span": None,
+            }
+
+        frames_until_failure = 0
+        correct_visible_frames = 0
+        first_failure_frame: Optional[int] = None
+        first_failure_offset: Optional[int] = None
+        first_failure_reason = ""
+        current_correct = 0
+        current_failure = 0
+        longest_correct = 0
+        longest_failure = 0
+        for row in visible_rows:
+            if selected_target_ok(row):
+                correct_visible_frames += 1
+                current_correct += 1
+                current_failure = 0
+                longest_correct = max(longest_correct, current_correct)
+                if first_failure_frame is None:
+                    frames_until_failure += 1
+                continue
+
+            current_correct = 0
+            current_failure += 1
+            longest_failure = max(longest_failure, current_failure)
+            if first_failure_frame is None:
+                first_failure_frame = row.frame
+                first_failure_offset = row.sample_offset
+                if row.identity_switch:
+                    first_failure_reason = "identity_switch"
+                elif row.track_lost:
+                    first_failure_reason = "track_lost"
+                elif not row.correct_object:
+                    first_failure_reason = "wrong_object"
+                elif row.identity_jump:
+                    first_failure_reason = "identity_jump"
+                else:
+                    first_failure_reason = "unknown_failure"
+
+        survived_visible_span = first_failure_frame is None
+        return {
+            "single_object_visible_frames": len(visible_rows),
+            "single_object_correct_visible_frames": correct_visible_frames,
+            "single_object_frames_until_first_failure": frames_until_failure,
+            "single_object_first_failure_frame": first_failure_frame,
+            "single_object_first_failure_offset": first_failure_offset,
+            "single_object_first_failure_reason": first_failure_reason,
+            "single_object_longest_correct_run": longest_correct,
+            "single_object_longest_failure_run": longest_failure,
+            "single_object_survived_visible_span": int(survived_visible_span),
+        }
+
     grouped: Dict[Tuple[str, str, str, str, str, int], List[IdentityObservation]] = {}
     for row in identity_rows:
         key = (
@@ -2010,6 +2153,130 @@ def summarize_identity(identity_rows: Sequence[IdentityObservation]) -> List[Dic
         summary_rows = visible_rows or list(rows)
         switch_count = sum(1 for row in summary_rows if row.identity_switch)
         lost_count = sum(1 for row in summary_rows if row.track_lost)
+        summary: Dict[str, object] = {
+            "sequence": sequence,
+            "lorat_config": lorat_config,
+            "execution_mode": execution_mode,
+            "reid_mode": reid_mode,
+            "v9_diagnostic_mode": diagnostic_mode,
+            "target_tracks": target_tracks,
+            "samples": len(rows),
+            "visible_samples": len(visible_rows),
+            "hidden_samples": len(rows) - len(visible_rows),
+            "correct_rate": sum(1 for row in summary_rows if row.correct_object) / len(summary_rows) if summary_rows else None,
+            "jump_rate": sum(1 for row in summary_rows if row.identity_jump) / len(summary_rows) if summary_rows else None,
+            "identity_switches": switch_count,
+            "identity_switches_per_1000_samples": (switch_count * 1000.0 / len(summary_rows)) if summary_rows else None,
+            "track_loss_rate": (lost_count / len(summary_rows)) if summary_rows else None,
+            "occluded_rate": sum(1 for row in rows if row.occluded) / len(rows) if rows else None,
+            "mean_iou": statistics.fmean(row.own_iou for row in summary_rows) if summary_rows else None,
+        }
+        summary.update(steady_tracking_stats(rows))
+        if target_tracks == 1:
+            summary.update(single_object_survival_stats(rows))
+        else:
+            summary.update(
+                {
+                    "single_object_visible_frames": "",
+                    "single_object_correct_visible_frames": "",
+                    "single_object_frames_until_first_failure": "",
+                    "single_object_first_failure_frame": "",
+                    "single_object_first_failure_offset": "",
+                    "single_object_first_failure_reason": "",
+                    "single_object_longest_correct_run": "",
+                    "single_object_longest_failure_run": "",
+                    "single_object_survived_visible_span": "",
+                }
+            )
+        summaries.append(summary)
+    return summaries
+
+
+def summarize_mot_paper_metrics(identity_rows: Sequence[IdentityObservation]) -> List[Dict[str, object]]:
+    thresholds = [round(value / 100.0, 2) for value in range(5, 100, 5)]
+    summary_threshold = 0.50
+
+    def prediction_present(row: IdentityObservation) -> bool:
+        lifecycle = str(row.lifecycle_state).lower()
+        state = str(row.state).lower()
+        return bool(row.ok) and lifecycle != "lost" and state not in {"lost", "inactive"}
+
+    def correct_at_threshold(row: IdentityObservation, threshold: float) -> bool:
+        return row.gt_visible and row.own_iou >= threshold and row.own_iou >= row.best_other_iou
+
+    def id_switch_at_threshold(row: IdentityObservation, threshold: float) -> bool:
+        return row.gt_visible and prediction_present(row) and row.best_other_iou >= threshold and row.best_other_iou > row.own_iou
+
+    def threshold_metrics(rows: Sequence[IdentityObservation], threshold: float) -> Dict[str, object]:
+        visible_rows = [row for row in rows if row.gt_visible]
+        correct_rows = [row for row in rows if correct_at_threshold(row, threshold)]
+        tp = len(correct_rows)
+        fn = max(0, len(visible_rows) - tp)
+        fp = sum(1 for row in rows if prediction_present(row) and not correct_at_threshold(row, threshold))
+        idsw = sum(1 for row in rows if id_switch_at_threshold(row, threshold))
+        gt_count = len(visible_rows)
+
+        mota = 1.0 - ((fn + fp + idsw) / gt_count) if gt_count else None
+        id_precision = tp / (tp + fp) if (tp + fp) else None
+        id_recall = tp / (tp + fn) if (tp + fn) else None
+        idf1 = (2.0 * tp / ((2.0 * tp) + fp + fn)) if ((2.0 * tp) + fp + fn) else None
+        deta = tp / (tp + fp + fn) if (tp + fp + fn) else None
+        loca = statistics.fmean(row.own_iou for row in correct_rows) if correct_rows else None
+
+        pair_rows: Dict[Tuple[int, int], List[IdentityObservation]] = {}
+        for row in rows:
+            pair_rows.setdefault((row.tracker_id, row.gt_track_id), []).append(row)
+        weighted_assoc = 0.0
+        assoc_weight = 0
+        for pair_group in pair_rows.values():
+            pair_tp = sum(1 for row in pair_group if correct_at_threshold(row, threshold))
+            if pair_tp == 0:
+                continue
+            pair_fn = sum(1 for row in pair_group if row.gt_visible and not correct_at_threshold(row, threshold))
+            pair_fp = sum(1 for row in pair_group if prediction_present(row) and not correct_at_threshold(row, threshold))
+            pair_assoc = pair_tp / (pair_tp + pair_fp + pair_fn) if (pair_tp + pair_fp + pair_fn) else 0.0
+            weighted_assoc += pair_tp * pair_assoc
+            assoc_weight += pair_tp
+        assa = weighted_assoc / assoc_weight if assoc_weight else None
+        hota = math.sqrt(deta * assa) if deta is not None and assa is not None else None
+        return {
+            "threshold": threshold,
+            "gt_count": gt_count,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "id_switches": idsw,
+            "mota": mota,
+            "id_precision": id_precision,
+            "id_recall": id_recall,
+            "idf1": idf1,
+            "deta": deta,
+            "assa": assa,
+            "hota": hota,
+            "loca": loca,
+        }
+
+    grouped: Dict[Tuple[str, str, str, str, str, int], List[IdentityObservation]] = {}
+    for row in identity_rows:
+        key = (
+            row.sequence,
+            row.lorat_config,
+            row.execution_mode,
+            row.reid_mode,
+            row.v9_diagnostic_mode,
+            row.target_tracks,
+        )
+        grouped.setdefault(key, []).append(row)
+
+    summaries: List[Dict[str, object]] = []
+    for (sequence, lorat_config, execution_mode, reid_mode, diagnostic_mode, target_tracks), rows in sorted(grouped.items()):
+        threshold_rows = [threshold_metrics(rows, threshold) for threshold in thresholds]
+        iou50 = threshold_metrics(rows, summary_threshold)
+
+        hota_values = [float(row["hota"]) for row in threshold_rows if row.get("hota") is not None]
+        deta_values = [float(row["deta"]) for row in threshold_rows if row.get("deta") is not None]
+        assa_values = [float(row["assa"]) for row in threshold_rows if row.get("assa") is not None]
+        loca_values = [float(row["loca"]) for row in threshold_rows if row.get("loca") is not None]
         summaries.append(
             {
                 "sequence": sequence,
@@ -2018,16 +2285,28 @@ def summarize_identity(identity_rows: Sequence[IdentityObservation]) -> List[Dic
                 "reid_mode": reid_mode,
                 "v9_diagnostic_mode": diagnostic_mode,
                 "target_tracks": target_tracks,
+                "actual_tracks": max((row.actual_tracks for row in rows), default=0),
                 "samples": len(rows),
-                "visible_samples": len(visible_rows),
-                "hidden_samples": len(rows) - len(visible_rows),
-                "correct_rate": sum(1 for row in summary_rows if row.correct_object) / len(summary_rows) if summary_rows else None,
-                "jump_rate": sum(1 for row in summary_rows if row.identity_jump) / len(summary_rows) if summary_rows else None,
-                "identity_switches": switch_count,
-                "identity_switches_per_1000_samples": (switch_count * 1000.0 / len(summary_rows)) if summary_rows else None,
-                "track_loss_rate": (lost_count / len(summary_rows)) if summary_rows else None,
-                "occluded_rate": sum(1 for row in rows if row.occluded) / len(rows) if rows else None,
-                "mean_iou": statistics.fmean(row.own_iou for row in summary_rows) if summary_rows else None,
+                "visible_gt_count": iou50["gt_count"],
+                "mot_iou_threshold": summary_threshold,
+                "mota_iou50": iou50["mota"],
+                "idf1_iou50": iou50["idf1"],
+                "id_precision_iou50": iou50["id_precision"],
+                "id_recall_iou50": iou50["id_recall"],
+                "tp_iou50": iou50["tp"],
+                "fp_iou50": iou50["fp"],
+                "fn_iou50": iou50["fn"],
+                "id_switches_iou50": iou50["id_switches"],
+                "hota": statistics.fmean(hota_values) if hota_values else None,
+                "deta": statistics.fmean(deta_values) if deta_values else None,
+                "assa": statistics.fmean(assa_values) if assa_values else None,
+                "loca": statistics.fmean(loca_values) if loca_values else None,
+                "hota_iou50": iou50["hota"],
+                "deta_iou50": iou50["deta"],
+                "assa_iou50": iou50["assa"],
+                "loca_iou50": iou50["loca"],
+                "hota_thresholds": ",".join(f"{threshold:.2f}" for threshold in thresholds),
+                "metric_scope": "selected_initialized_targets",
             }
         )
     return summaries
@@ -2178,6 +2457,7 @@ def append_week2_proof_rows(
     sequence: str,
     lorat_config: str,
     reid_mode: str,
+    diagnostic_mode: str,
     target_tracks: int,
     actual_tracks: int,
     lines: Sequence[str],
@@ -2187,6 +2467,7 @@ def append_week2_proof_rows(
             "sequence": sequence,
             "lorat_config": lorat_config,
             "reid_mode": reid_mode,
+            "diagnostic_mode": diagnostic_mode,
             "target_tracks": target_tracks,
             "actual_tracks": actual_tracks,
         }
@@ -2322,6 +2603,7 @@ def run_benchmark_case(
             sequence_path.name,
             lorat_config,
             reid_mode,
+            str(getattr(args, "v9_diagnostic_mode", "normal") or "normal"),
             target_tracks,
             actual_tracks,
             init_frame,
@@ -2390,6 +2672,7 @@ def run_benchmark_case(
                 sequence_path.name,
                 lorat_config,
                 reid_mode,
+                str(getattr(args, "v9_diagnostic_mode", "normal") or "normal"),
                 target_tracks,
                 actual_tracks,
                 init_frame,
@@ -2468,6 +2751,7 @@ def run_benchmark_case(
             sequence_path.name,
             lorat_config,
             reid_mode,
+            str(getattr(args, "v9_diagnostic_mode", "normal") or "normal"),
             target_tracks,
             len(backend.tracks),
             backend.week2_proof_lines,
@@ -3341,7 +3625,7 @@ def write_summary_md(
     controlled_occlusion_rows: Sequence[Dict[str, object]],
 ) -> None:
     lines = [
-        "# LoRAT v8 Benchmark Summary",
+        "# LoRAT V9 Benchmark Summary",
         "",
         "## Run",
         "",
@@ -3367,6 +3651,9 @@ def write_summary_md(
         "- ReID-on mode extracts explicit DINOv2 crop embeddings by batching candidate image crops through the LoRA-adapted DINOv2 backbone, then compares them with per-track crop-memory banks.",
         "- Identity switch counts a sampled frame where the tracker box matches a different visible GT object than the initialized GT object.",
         "- Track loss counts a sampled frame where the track is marked lost/not-ok or no visible GT object reaches the identity IoU threshold.",
+        "- Steady tracking frames-until-failure is computed per tracker as visible sampled frames correctly matched to the initialized GT identity before the first wrong-object, identity-switch, or track-lost event.",
+        "- N1 frames until first failure counts visible sampled frames where the single initialized object remains correctly matched before the first wrong-object, identity-switch, or track-lost event.",
+        "- Paper-style MOT metrics are computed over initialized selected targets. `MOTA` and `IDF1` are reported at IoU 0.50; `HOTA` is averaged over IoU thresholds 0.05 through 0.95.",
         "- Natural occlusion diagnostics report the longest sampled uncertain/occluded gap that later returns to a correct object match.",
         "- Controlled occlusion survival masks the initialized object's current GT box for fixed durations, then measures whether the same track reattaches to the same GT identity within the recovery window.",
         f"- 25 FPS capacity rule: maximum actual N with tracking FPS >= `{args.fps_threshold}`.",
@@ -3380,6 +3667,7 @@ def write_summary_md(
         f"- Sampled area observations: `{paths.observations_csv}`",
         f"- Identity observations: `{paths.identity_csv}`",
         f"- Identity/ReID summary: `{paths.identity_summary_csv}`",
+        f"- Paper-style MOT metrics: `{paths.mot_metrics_csv}`",
         f"- Natural occlusion diagnostics: `{paths.occlusion_survival_csv}`",
         f"- Controlled occlusion trials: `{paths.controlled_occlusion_trials_csv}`",
         f"- Controlled occlusion survival: `{paths.controlled_occlusion_survival_csv}`",
@@ -3521,15 +3809,38 @@ def write_summary_md(
     identity_summary = summarize_identity(identity_rows)
     if identity_summary:
         lines.extend(["", "## Identity Sampling", ""])
-        lines.append("| Sequence | Config | ReID Mode | Diagnostic Mode | N Target | Samples | Visible | Hidden | Correct Rate | ID Switches | Track-Loss Rate | Jump Rate | Occluded Rate | Mean IoU |")
-        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        lines.append("| Sequence | Config | ReID Mode | Diagnostic Mode | N Target | Samples | Visible | Hidden | Correct Rate | ID Switches | Track-Loss Rate | Jump Rate | Occluded Rate | Mean IoU | Steady Mean Frames Until Failure | Steady Min Frames Until Failure | Steady Max Longest Correct Run | N1 Frames Until First Failure | N1 First Failure | N1 Longest Correct Run |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for row in identity_summary:
+            first_failure = ""
+            if row.get("single_object_first_failure_reason"):
+                first_failure = f"{row['single_object_first_failure_reason']}@{row.get('single_object_first_failure_offset', '')}"
             lines.append(
                 f"| {row['sequence']} | {row['lorat_config']} | {row['reid_mode']} | "
                 f"{row['v9_diagnostic_mode']} | {row['target_tracks']} | {row['samples']} | {row['visible_samples']} | {row['hidden_samples']} | "
                 f"{bench.optional_float(row['correct_rate'], 3)} | {row['identity_switches']} | "
                 f"{bench.optional_float(row['track_loss_rate'], 3)} | {bench.optional_float(row['jump_rate'], 3)} | "
-                f"{bench.optional_float(row['occluded_rate'], 3)} | {bench.optional_float(row['mean_iou'], 3)} |"
+                f"{bench.optional_float(row['occluded_rate'], 3)} | {bench.optional_float(row['mean_iou'], 3)} | "
+                f"{bench.optional_float(row.get('steady_mean_frames_until_failure'), 1)} | "
+                f"{row.get('steady_min_frames_until_failure', '')} | "
+                f"{row.get('steady_max_longest_correct_run', '')} | "
+                f"{row.get('single_object_frames_until_first_failure', '')} | {first_failure} | "
+                f"{row.get('single_object_longest_correct_run', '')} |"
+            )
+    mot_metrics_summary = summarize_mot_paper_metrics(identity_rows)
+    if mot_metrics_summary:
+        lines.extend(["", "## Paper-Style MOT Metrics", ""])
+        lines.append("| Sequence | Config | ReID Mode | Diagnostic Mode | N Target | MOTA@0.50 | IDF1@0.50 | HOTA | DetA | AssA | LocA | TP@0.50 | FP@0.50 | FN@0.50 | IDSW@0.50 | Scope |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for row in mot_metrics_summary:
+            lines.append(
+                f"| {row['sequence']} | {row['lorat_config']} | {row['reid_mode']} | "
+                f"{row['v9_diagnostic_mode']} | {row['target_tracks']} | "
+                f"{bench.optional_float(row['mota_iou50'], 3)} | {bench.optional_float(row['idf1_iou50'], 3)} | "
+                f"{bench.optional_float(row['hota'], 3)} | {bench.optional_float(row['deta'], 3)} | "
+                f"{bench.optional_float(row['assa'], 3)} | {bench.optional_float(row['loca'], 3)} | "
+                f"{row['tp_iou50']} | {row['fp_iou50']} | {row['fn_iou50']} | {row['id_switches_iou50']} | "
+                f"{row['metric_scope']} |"
             )
     occlusion_summary = summarize_occlusion_survival(identity_rows)
     if occlusion_summary:
@@ -3617,6 +3928,57 @@ def flush_outputs(
             "track_loss_rate",
             "occluded_rate",
             "mean_iou",
+            "steady_tracker_count",
+            "steady_mean_frames_until_failure",
+            "steady_min_frames_until_failure",
+            "steady_max_frames_until_failure",
+            "steady_mean_longest_correct_run",
+            "steady_min_longest_correct_run",
+            "steady_max_longest_correct_run",
+            "steady_survived_span_rate",
+            "single_object_visible_frames",
+            "single_object_correct_visible_frames",
+            "single_object_frames_until_first_failure",
+            "single_object_first_failure_frame",
+            "single_object_first_failure_offset",
+            "single_object_first_failure_reason",
+            "single_object_longest_correct_run",
+            "single_object_longest_failure_run",
+            "single_object_survived_visible_span",
+        ],
+    )
+    write_dict_rows_csv(
+        paths.mot_metrics_csv,
+        summarize_mot_paper_metrics(identity_rows),
+        [
+            "sequence",
+            "lorat_config",
+            "execution_mode",
+            "reid_mode",
+            "v9_diagnostic_mode",
+            "target_tracks",
+            "actual_tracks",
+            "samples",
+            "visible_gt_count",
+            "mot_iou_threshold",
+            "mota_iou50",
+            "idf1_iou50",
+            "id_precision_iou50",
+            "id_recall_iou50",
+            "tp_iou50",
+            "fp_iou50",
+            "fn_iou50",
+            "id_switches_iou50",
+            "hota",
+            "deta",
+            "assa",
+            "loca",
+            "hota_iou50",
+            "deta_iou50",
+            "assa_iou50",
+            "loca_iou50",
+            "hota_thresholds",
+            "metric_scope",
         ],
     )
     write_dict_rows_csv(
@@ -3735,7 +4097,7 @@ def main() -> int:
     candidate_rows: List[Dict[str, object]] = []
     debug_rows: List[Dict[str, object]] = []
 
-    print(f"LoRAT v8 benchmark run label: {label}", flush=True)
+    print(f"LoRAT V9 benchmark run label: {label}", flush=True)
     print(f"Output folder: {paths.run_root}", flush=True)
     print(f"Timing CSV: {paths.timing_csv}", flush=True)
     print(f"Area reliability CSV: {paths.area_csv}", flush=True)
@@ -3892,7 +4254,7 @@ def main() -> int:
                         debug_rows,
                     )
                     if STOP_REQUESTED:
-                        print("Stop requested; flushed partial v8 benchmark outputs and exiting cleanly.", flush=True)
+                        print("Stop requested; flushed partial V9 benchmark outputs and exiting cleanly.", flush=True)
                         return 0
 
     controlled_occlusion_rows.extend(
@@ -3947,7 +4309,7 @@ def main() -> int:
         candidate_rows,
         debug_rows,
     )
-    print("Wrote LoRAT v8 benchmark files:", flush=True)
+    print("Wrote LoRAT V9 benchmark files:", flush=True)
     print(f"  {paths.timing_csv}", flush=True)
     print(f"  {paths.area_csv}", flush=True)
     print(f"  {paths.observations_csv}", flush=True)
@@ -3967,5 +4329,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

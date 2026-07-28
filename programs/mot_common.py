@@ -124,6 +124,7 @@ class TrackState:
     other_anchor_score: Optional[float] = None
     other_anchor_track_id: Optional[int] = None
     identity_margin: Optional[float] = None
+    negative_anchor_score: Optional[float] = None
     occlusion_track_id: Optional[int] = None
     occlusion_iou: Optional[float] = None
     kalman: Optional["BBoxKalmanFilter"] = None
@@ -146,6 +147,8 @@ class TrackState:
     v8_initial_crop_feature: Optional[object] = None
     v8_appearance_crop_feature: Optional[object] = None
     v8_crop_feature_bank: List[object] = field(default_factory=list)
+    v8_negative_feature_bank: List[object] = field(default_factory=list)
+    v8_negative_crop_feature_bank: List[object] = field(default_factory=list)
 
 
 @dataclass
@@ -235,6 +238,7 @@ class IdentityScore:
     identity_margin: float
     occlusion_track_id: Optional[int]
     occlusion_iou: float
+    negative_anchor: float = 0.0
 
 
 @dataclass(frozen=True)

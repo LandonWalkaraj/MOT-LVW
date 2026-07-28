@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+"""V9-owned runtime infrastructure snapshot.
+
+This file is intentionally copied forward from the mature V8 tracker runtime so
+V9 can be standalone from older versioned files while retaining the stable
+LoRaT loading, batched-head, track-state, ReID, logging, and UI infrastructure
+that V9 still builds on. V9-specific tracker decisions live in
+``bounding_box_v9_lorat_local_search.py``.
+"""
+
 import argparse
 import copy
 import os
@@ -84,6 +93,18 @@ V8_PROFILE_BUCKETS = (
     "appearance_refresh",
     "proof_output",
 )
+
+V9_BASE_EXECUTION_MODE = V8_EXECUTION_MODE
+DEFAULT_V9_BASE_DISTRACTOR_MIN_SIMILARITY = DEFAULT_V8_DISTRACTOR_MIN_SIMILARITY
+DEFAULT_V9_BASE_SMALL_TARGET_MODE = DEFAULT_V8_SMALL_TARGET_MODE
+DEFAULT_V9_BASE_SMALL_TARGET_AREA = DEFAULT_V8_SMALL_TARGET_AREA
+DEFAULT_V9_BASE_SMALL_TARGET_MAX_SIDE = DEFAULT_V8_SMALL_TARGET_MAX_SIDE
+DEFAULT_V9_BASE_SMALL_TARGET_MAX_SCALE_CHANGE = DEFAULT_V8_SMALL_TARGET_MAX_SCALE_CHANGE
+DEFAULT_V9_BASE_SMALL_TARGET_TEMPLATE_MIN_SCORE = DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_SCORE
+DEFAULT_V9_BASE_SMALL_TARGET_TEMPLATE_MIN_MOTION = DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_MOTION
+DEFAULT_V9_BASE_SMALL_TARGET_TEMPLATE_MIN_PATH = DEFAULT_V8_SMALL_TARGET_TEMPLATE_MIN_PATH
+DEFAULT_V9_BASE_SMALL_TARGET_CONFIDENCE_FLOOR = DEFAULT_V8_SMALL_TARGET_CONFIDENCE_FLOOR
+DEFAULT_V9_BASE_WINDOW_PENALTY_RATIO = DEFAULT_V8_WINDOW_PENALTY_RATIO
 
 
 @dataclass(frozen=True)
@@ -5180,6 +5201,15 @@ def write_v8_debug_log(path: Path, lines: Sequence[str]) -> None:
 
 def default_video_path(source_name: str) -> Path:
     return mot.default_video_path(source_name, "lorat_v8")
+
+
+BASE_EXECUTION_MODE = V9_BASE_EXECUTION_MODE
+DEFAULT_DISTRACTOR_MIN_SIMILARITY = DEFAULT_V9_BASE_DISTRACTOR_MIN_SIMILARITY
+HeadCandidate = V8HeadCandidate
+HeadCandidateInfo = V8HeadCandidateInfo
+QualityBatchedLoRATTracker = V8QualityBatchedLoRATTracker
+append_debug_rows = append_v8_debug_rows
+write_debug_log = write_v8_debug_log
 
 
 def main() -> int:

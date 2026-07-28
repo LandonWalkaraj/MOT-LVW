@@ -2,19 +2,23 @@
 
 LoRaT-based multi-object tracking research code for selected-object video labeling.
 
-The current development line is V9: a local-search tracker that keeps LoRaT as the single-object tracking backbone while adding multi-object coordination, re-identification/recovery logic, and a trainable selected-target head. V8 remains in the repo because V9 reuses its shared utilities, training data adapters, and model-head components.
+The current development line is V9: a local-search tracker that keeps LoRaT as the single-object tracking backbone while adding multi-object coordination, re-identification/recovery logic, and a trainable selected-target head. V9 is kept standalone from older version files through V9-owned runtime, training-data, and benchmark harness snapshots. V8 remains as a baseline/demo branch for comparison.
 
 ## Current Working Set
 
 The files that matter for current development are:
 
 - `programs/bounding_box_v9_lorat_local_search.py` - current V9 tracker.
+- `programs/bounding_box_v9_runtime_base.py` - V9-owned runtime infrastructure snapshot.
 - `programs/train_lorat_v9_local_search_head.py` - current V9 head trainer.
+- `programs/train_lorat_v9_data_common.py` - V9-owned mixed-dataset/training utility snapshot.
 - `programs/benchmark_lorat_v9.py` - current V9 benchmark entrypoint.
+- `programs/benchmark_lorat_v9_harness.py` - V9-owned benchmark harness snapshot.
+- `programs/analyze_v9_diagnostic_benchmark.py` - V9 diagnostic result analyzer.
 - `programs/bounding_box_v9_lorat_open_world.py` - Week 4/open-world scaffold.
-- `programs/bounding_box_v8_lorat_quality_batched.py` - V8 tracker/head components reused by V9.
-- `programs/train_lorat_v8_head.py` - V8 dataset/training utilities reused by V9.
-- `programs/benchmark_lorat_v8.py` - V8 benchmark utilities reused by V9.
+- `programs/bounding_box_v8_lorat_quality_batched.py` - V8 baseline/demo tracker retained for comparison.
+- `programs/train_lorat_v8_head.py` - V8 baseline trainer retained for comparison.
+- `programs/benchmark_lorat_v8.py` - V8 baseline benchmark retained for comparison.
 - `programs/mot_common.py` - shared MOT/ReID/geometry helpers.
 - `programs/exercise_lorat_mot.py` - DanceTrack/MOT sequence helpers.
 - `programs/export_tao_to_mot_sequences.py` - TAO export/adapter helper.

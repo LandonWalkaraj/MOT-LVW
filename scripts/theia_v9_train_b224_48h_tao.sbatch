@@ -6,10 +6,10 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH --time=48:00:00
+#SBATCH --time=24:00:00
 #SBATCH --signal=TERM@600
 #SBATCH --gres=gpu:1
-#SBATCH --output=/work/%u/lorat-v9-train-b224-48h-%j.out
+#SBATCH --output=/work/%u/lorat-v9-train-b224-24h-%j.out
 
 set -euo pipefail
 
@@ -21,17 +21,17 @@ fi
 BUNDLE="${BUNDLE:-/work/$USER/theia_lorat_v8_train_bundle.tar.gz}"
 UPDATE_ROOT="${UPDATE_ROOT:-/work/$USER/lorat-v9-live-updates}"
 RUN_ROOT="${RUN_ROOT:-/work/$USER/lorat-v9-train-job-$SLURM_JOB_ID}"
-RESULT_ROOT="${RESULT_ROOT:-/work/$USER/lorat-v9-train-results-b224-tao-48h-$SLURM_JOB_ID}"
+RESULT_ROOT="${RESULT_ROOT:-/work/$USER/lorat-v9-train-results-b224-tao-24h-$SLURM_JOB_ID}"
 VENV_DIR="${VENV_DIR:-/work/$USER/lorat-v9-venv-cu128}"
 PYTORCH_INDEX_URL="${PYTORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 PIP_CACHE_DIR="${PIP_CACHE_DIR:-/work/$USER/.cache/pip}"
 EXPECT_GPU_NAME="${EXPECT_GPU_NAME:-A100}"
 CLEANUP_RUN_ROOT="${CLEANUP_RUN_ROOT:-1}"
 
-DATASET_ROOT="${DATASET_ROOT:-}"
-MOT17_ROOT="${MOT17_ROOT:-}"
-TAO_ROOT="${TAO_ROOT:-/work/$USER/TAO_OW_SUBSET}"
-LASOT_ROOT="${LASOT_ROOT:-/work/$USER/LaSOT_subset}"
+DATASET_ROOT="${DATASET_ROOT:-/work/$USER/lorat-data/raw/DanceTrack}"
+MOT17_ROOT="${MOT17_ROOT:-/work/$USER/lorat-data/raw/MOT17}"
+TAO_ROOT="${TAO_ROOT:-/work/$USER/lorat-data/raw/TAO_OW_SUBSET}"
+LASOT_ROOT="${LASOT_ROOT:-/work/$USER/lorat-data/raw/LaSOT_subset}"
 LASOT_ARCHIVE="${LASOT_ARCHIVE:-/work/$USER/LaSOT_subset.tar.gz}"
 TRAIN_SPLIT="${TRAIN_SPLIT:-train}"
 VAL_SPLIT="${VAL_SPLIT:-val}"
@@ -44,10 +44,11 @@ LASOT_SPLIT="${LASOT_SPLIT:-train}"
 LASOT_VAL_SPLIT="${LASOT_VAL_SPLIT:-val}"
 LASOT_VAL_FRACTION="${LASOT_VAL_FRACTION:-0.20}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-B-224}"
+CONFIG_SAFE="${TRAIN_CONFIG//-/_}"
 
 MAX_OBJECTS="${MAX_OBJECTS:-8}"
 TARGET_REGION_MODE="${TARGET_REGION_MODE:-mixed}"
-TARGET_REGIONS_PER_OBJECT="${TARGET_REGIONS_PER_OBJECT:-4}"
+TARGET_REGIONS_PER_OBJECT="${TARGET_REGIONS_PER_OBJECT:-6}"
 TEMPLATE_AREA_FACTOR="${TEMPLATE_AREA_FACTOR:-2.0}"
 SEARCH_AREA_FACTOR="${SEARCH_AREA_FACTOR:-4.0}"
 SEARCH_SCALE_JITTER="${SEARCH_SCALE_JITTER:-0.25}"
@@ -62,13 +63,17 @@ SEQUENCE_WINDOW_LENGTH="${SEQUENCE_WINDOW_LENGTH:-5}"
 LOST_TARGET_PROBABILITY="${LOST_TARGET_PROBABILITY:-0.10}"
 MAX_LOST_TARGETS_PER_FRAME="${MAX_LOST_TARGETS_PER_FRAME:-2}"
 MAX_MISSING_GAP_FRAMES="${MAX_MISSING_GAP_FRAMES:-30}"
+DRIFT_NEGATIVE_PROBABILITY="${DRIFT_NEGATIVE_PROBABILITY:-0.35}"
+DRIFT_NEGATIVE_START_EPOCH="${DRIFT_NEGATIVE_START_EPOCH:-3}"
+DRIFT_NEGATIVE_MAX_PER_FRAME="${DRIFT_NEGATIVE_MAX_PER_FRAME:-2}"
+DRIFT_NEGATIVE_SHIFT_FACTOR="${DRIFT_NEGATIVE_SHIFT_FACTOR:-3.0}"
 
 FRAME_STRIDE="${FRAME_STRIDE:-5}"
 VAL_FRAME_STRIDE="${VAL_FRAME_STRIDE:-15}"
 MOT17_FRAME_STRIDE="${MOT17_FRAME_STRIDE:-5}"
 MOT17_VAL_FRAME_STRIDE="${MOT17_VAL_FRAME_STRIDE:-15}"
-TAO_FRAME_STRIDE="${TAO_FRAME_STRIDE:-5}"
-TAO_VAL_FRAME_STRIDE="${TAO_VAL_FRAME_STRIDE:-15}"
+TAO_FRAME_STRIDE="${TAO_FRAME_STRIDE:-2}"
+TAO_VAL_FRAME_STRIDE="${TAO_VAL_FRAME_STRIDE:-5}"
 LASOT_FRAME_STRIDE="${LASOT_FRAME_STRIDE:-5}"
 LASOT_VAL_FRAME_STRIDE="${LASOT_VAL_FRAME_STRIDE:-15}"
 MAX_SEQUENCES="${MAX_SEQUENCES:-0}"
@@ -90,9 +95,10 @@ LASOT_MAX_VAL_SAMPLES="${LASOT_MAX_VAL_SAMPLES:-256}"
 
 EPOCHS="${EPOCHS:-250}"
 MAX_TRAIN_SAMPLES_PER_EPOCH="${MAX_TRAIN_SAMPLES_PER_EPOCH:-2048}"
+SOURCE_SAMPLING_WEIGHTS="${SOURCE_SAMPLING_WEIGHTS:-MOTFrameHeadDataset=1.0,TAOFrameHeadDataset=4.0,LaSOTFrameHeadDataset=1.5}"
 MAX_STEPS="${MAX_STEPS:-0}"
-MAX_WALL_HOURS="${MAX_WALL_HOURS:-47.25}"
-EVAL_INTERVAL_EPOCHS="${EVAL_INTERVAL_EPOCHS:-5}"
+MAX_WALL_HOURS="${MAX_WALL_HOURS:-23.25}"
+EVAL_INTERVAL_EPOCHS="${EVAL_INTERVAL_EPOCHS:-2}"
 TRAIN_DIAGNOSTIC_SAMPLES="${TRAIN_DIAGNOSTIC_SAMPLES:-96}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
@@ -109,6 +115,15 @@ SMALL_TARGET_MAX_SIDE="${SMALL_TARGET_MAX_SIDE:-96.0}"
 DCFST_DISCRIMINATION_WEIGHT="${DCFST_DISCRIMINATION_WEIGHT:-0.70}"
 ASSIGNMENT_DISCRIMINATION_WEIGHT="${ASSIGNMENT_DISCRIMINATION_WEIGHT:-0.50}"
 ASSIGNMENT_MARGIN="${ASSIGNMENT_MARGIN:-0.25}"
+CANDIDATE_RANKING_LOSS_WEIGHT="${CANDIDATE_RANKING_LOSS_WEIGHT:-0.60}"
+CANDIDATE_RANKING_START_EPOCH="${CANDIDATE_RANKING_START_EPOCH:-3}"
+CANDIDATE_RANKING_MARGIN="${CANDIDATE_RANKING_MARGIN:-0.25}"
+CANDIDATE_RANKING_TOPK="${CANDIDATE_RANKING_TOPK:-16}"
+CANDIDATE_RANKING_POSITIVE_IOU="${CANDIDATE_RANKING_POSITIVE_IOU:-0.35}"
+CANDIDATE_RANKING_OTHER_IOU="${CANDIDATE_RANKING_OTHER_IOU:-0.30}"
+ROLLOUT_IDENTITY_SWITCH_PENALTY="${ROLLOUT_IDENTITY_SWITCH_PENALTY:-0.75}"
+ROLLOUT_WINDOW_MISS_PENALTY="${ROLLOUT_WINDOW_MISS_PENALTY:-0.25}"
+ROLLOUT_VALIDATION_MODE="${ROLLOUT_VALIDATION_MODE:-sequence}"
 GEOMETRY_ONLY_EPOCHS="${GEOMETRY_ONLY_EPOCHS:-2}"
 HARD_NEGATIVE_START_EPOCH="${HARD_NEGATIVE_START_EPOCH:-3}"
 REID_START_EPOCH="${REID_START_EPOCH:-5}"
@@ -117,7 +132,8 @@ ASSIGNMENT_START_EPOCH="${ASSIGNMENT_START_EPOCH:-3}"
 CLOSED_LOOP_START_EPOCH="${CLOSED_LOOP_START_EPOCH:-5}"
 CLOSED_LOOP_PROBABILITY="${CLOSED_LOOP_PROBABILITY:-0.35}"
 CLIP_MAX_NORM="${CLIP_MAX_NORM:-1.0}"
-CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-250}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-1000}"
+CHECKPOINT_RETENTION="${CHECKPOINT_RETENTION:-latest}"
 HEAD_HIDDEN_DIM="${HEAD_HIDDEN_DIM:-256}"
 HEAD_LORA_RANK="${HEAD_LORA_RANK:-16}"
 HEAD_RANK="${HEAD_RANK:-5}"
@@ -125,6 +141,23 @@ SEARCH_RADIUS_FACTOR="${SEARCH_RADIUS_FACTOR:-2.25}"
 WINDOW_PENALTY_RATIO="${WINDOW_PENALTY_RATIO:-0.25}"
 LOCAL_GRID_SIZE="${LOCAL_GRID_SIZE:-17}"
 TRAINING_MEMORY_SLOTS="${TRAINING_MEMORY_SLOTS:-3}"
+AUTO_RESUME_HEAD="${AUTO_RESUME_HEAD:-1}"
+RESUME_HEAD="${RESUME_HEAD:-}"
+
+if [[ -z "$RESUME_HEAD" && "$AUTO_RESUME_HEAD" == "1" ]]; then
+    while IFS= read -r candidate; do
+        if [[ -n "$candidate" && -f "$candidate" && "$candidate" != "$RESULT_ROOT"* ]]; then
+            RESUME_HEAD="$candidate"
+            break
+        fi
+    done < <(
+        {
+            ls -t /work/"$USER"/lorat-v9-train-results*/checkpoints/"$CONFIG_SAFE"/v9_local_head_"$CONFIG_SAFE"_best_by_rollout_identity.pt 2>/dev/null || true
+            ls -t /work/"$USER"/lorat-v9-train-results*/checkpoints/"$CONFIG_SAFE"/v9_local_head_"$CONFIG_SAFE"_best_by_val_iou.pt 2>/dev/null || true
+            ls -t /work/"$USER"/lorat-v9-train-results*/checkpoints/"$CONFIG_SAFE"/v9_local_head_"$CONFIG_SAFE"_latest.pt 2>/dev/null || true
+        }
+    )
+fi
 
 export PIP_CACHE_DIR
 
@@ -139,6 +172,17 @@ echo "Train config: $TRAIN_CONFIG"
 echo "Epochs: $EPOCHS"
 echo "Max wall hours: $MAX_WALL_HOURS"
 echo "Max train samples per epoch: $MAX_TRAIN_SAMPLES_PER_EPOCH"
+echo "Source sampling weights: ${SOURCE_SAMPLING_WEIGHTS:-none}"
+echo "Eval interval epochs: $EVAL_INTERVAL_EPOCHS"
+echo "Checkpoint interval: $CHECKPOINT_INTERVAL"
+echo "Checkpoint retention: $CHECKPOINT_RETENTION"
+echo "Candidate ranking loss weight: $CANDIDATE_RANKING_LOSS_WEIGHT"
+echo "Candidate ranking start epoch: $CANDIDATE_RANKING_START_EPOCH"
+echo "Candidate ranking margin/topk: $CANDIDATE_RANKING_MARGIN / $CANDIDATE_RANKING_TOPK"
+echo "Drift negatives probability/start/max/shift: $DRIFT_NEGATIVE_PROBABILITY / $DRIFT_NEGATIVE_START_EPOCH / $DRIFT_NEGATIVE_MAX_PER_FRAME / $DRIFT_NEGATIVE_SHIFT_FACTOR"
+echo "Rollout identity/window penalties: $ROLLOUT_IDENTITY_SWITCH_PENALTY / $ROLLOUT_WINDOW_MISS_PENALTY"
+echo "Rollout validation mode: $ROLLOUT_VALIDATION_MODE"
+echo "Resume head: ${RESUME_HEAD:-none}"
 echo "TAO root: ${TAO_ROOT:-none}"
 echo "LaSOT root: ${LASOT_ROOT:-none}"
 echo "LaSOT archive: ${LASOT_ARCHIVE:-none}"
@@ -165,20 +209,28 @@ if [[ -d "$UPDATE_ROOT" ]]; then
 fi
 
 if [[ -z "$DATASET_ROOT" ]]; then
-    if [[ -d "$PWD/data/raw/Combined" ]]; then
+    if [[ -d "/work/$USER/lorat-data/raw/Combined" ]]; then
+        DATASET_ROOT="/work/$USER/lorat-data/raw/Combined"
+    elif [[ -d "/work/$USER/lorat-data/raw/DanceTrack" ]]; then
+        DATASET_ROOT="/work/$USER/lorat-data/raw/DanceTrack"
+    elif [[ -d "$PWD/data/raw/Combined" ]]; then
         DATASET_ROOT="$PWD/data/raw/Combined"
     else
         DATASET_ROOT="$PWD/data/raw/DanceTrack"
     fi
 fi
 if [[ -z "$MOT17_ROOT" ]]; then
-    if [[ -d "$PWD/data/raw/MOTChallenge/MOT17" ]]; then
+    if [[ -d "/work/$USER/lorat-data/raw/MOT17" ]]; then
+        MOT17_ROOT="/work/$USER/lorat-data/raw/MOT17"
+    elif [[ -d "$PWD/data/raw/MOTChallenge/MOT17" ]]; then
         MOT17_ROOT="$PWD/data/raw/MOTChallenge/MOT17"
     elif [[ -d "$PWD/data/raw/MOT17" ]]; then
         MOT17_ROOT="$PWD/data/raw/MOT17"
     fi
 fi
-if [[ -z "${TAO_ROOT:-}" && -d "$PWD/data/raw/TAO_OW_SUBSET" ]]; then
+if [[ -z "${TAO_ROOT:-}" && -d "/work/$USER/lorat-data/raw/TAO_OW_SUBSET" ]]; then
+    TAO_ROOT="/work/$USER/lorat-data/raw/TAO_OW_SUBSET"
+elif [[ -z "${TAO_ROOT:-}" && -d "$PWD/data/raw/TAO_OW_SUBSET" ]]; then
     TAO_ROOT="$PWD/data/raw/TAO_OW_SUBSET"
 fi
 if [[ -n "${LASOT_ROOT:-}" && ! -d "$LASOT_ROOT" && -f "${LASOT_ARCHIVE:-}" ]]; then
@@ -186,7 +238,9 @@ if [[ -n "${LASOT_ROOT:-}" && ! -d "$LASOT_ROOT" && -f "${LASOT_ARCHIVE:-}" ]]; 
     mkdir -p "$(dirname "$LASOT_ROOT")"
     tar -xzf "$LASOT_ARCHIVE" -C "$(dirname "$LASOT_ROOT")"
 fi
-if [[ -z "${LASOT_ROOT:-}" && -d "$PWD/data/raw/LaSOT_subset" ]]; then
+if [[ -z "${LASOT_ROOT:-}" && -d "/work/$USER/lorat-data/raw/LaSOT_subset" ]]; then
+    LASOT_ROOT="/work/$USER/lorat-data/raw/LaSOT_subset"
+elif [[ -z "${LASOT_ROOT:-}" && -d "$PWD/data/raw/LaSOT_subset" ]]; then
     LASOT_ROOT="$PWD/data/raw/LaSOT_subset"
 fi
 
@@ -276,7 +330,6 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 mkdir -p "$RESULT_ROOT/models/lorat" "$RESULT_ROOT/checkpoints" "$RESULT_ROOT/logs"
-CONFIG_SAFE="${TRAIN_CONFIG//-/_}"
 OUTPUT="$RESULT_ROOT/models/lorat/v9_local_head_${CONFIG_SAFE}.pt"
 CHECKPOINT_DIR="$RESULT_ROOT/checkpoints/$CONFIG_SAFE"
 LOG_PATH="$RESULT_ROOT/logs/train_${CONFIG_SAFE}.log"
@@ -296,6 +349,11 @@ if [[ -z "${TAO_ROOT:-}" || ! -d "$TAO_ROOT" ]]; then
 fi
 if [[ -z "${LASOT_ROOT:-}" || ! -d "$LASOT_ROOT" ]]; then
     EXTRA_ARGS+=(--disable-lasot)
+fi
+if [[ -n "${RESUME_HEAD:-}" && -f "$RESUME_HEAD" ]]; then
+    EXTRA_ARGS+=(--resume-head "$RESUME_HEAD")
+else
+    EXTRA_ARGS+=(--auto-resume-latest)
 fi
 
 echo "============================================================"
@@ -338,6 +396,10 @@ python programs/train_lorat_v9_local_search_head.py \
     --lost-target-probability "$LOST_TARGET_PROBABILITY" \
     --max-lost-targets-per-frame "$MAX_LOST_TARGETS_PER_FRAME" \
     --max-missing-gap-frames "$MAX_MISSING_GAP_FRAMES" \
+    --drift-negative-probability "$DRIFT_NEGATIVE_PROBABILITY" \
+    --drift-negative-start-epoch "$DRIFT_NEGATIVE_START_EPOCH" \
+    --drift-negative-max-per-frame "$DRIFT_NEGATIVE_MAX_PER_FRAME" \
+    --drift-negative-shift-factor "$DRIFT_NEGATIVE_SHIFT_FACTOR" \
     --frame-stride "$FRAME_STRIDE" \
     --val-frame-stride "$VAL_FRAME_STRIDE" \
     --mot17-frame-stride "$MOT17_FRAME_STRIDE" \
@@ -364,6 +426,7 @@ python programs/train_lorat_v9_local_search_head.py \
     --lasot-max-val-samples "$LASOT_MAX_VAL_SAMPLES" \
     --epochs "$EPOCHS" \
     --max-train-samples-per-epoch "$MAX_TRAIN_SAMPLES_PER_EPOCH" \
+    --source-sampling-weights "$SOURCE_SAMPLING_WEIGHTS" \
     --max-steps "$MAX_STEPS" \
     --max-wall-hours "$MAX_WALL_HOURS" \
     --eval-interval-epochs "$EVAL_INTERVAL_EPOCHS" \
@@ -383,6 +446,15 @@ python programs/train_lorat_v9_local_search_head.py \
     --dcfst-discrimination-weight "$DCFST_DISCRIMINATION_WEIGHT" \
     --assignment-discrimination-weight "$ASSIGNMENT_DISCRIMINATION_WEIGHT" \
     --assignment-margin "$ASSIGNMENT_MARGIN" \
+    --candidate-ranking-loss-weight "$CANDIDATE_RANKING_LOSS_WEIGHT" \
+    --candidate-ranking-start-epoch "$CANDIDATE_RANKING_START_EPOCH" \
+    --candidate-ranking-margin "$CANDIDATE_RANKING_MARGIN" \
+    --candidate-ranking-topk "$CANDIDATE_RANKING_TOPK" \
+    --candidate-ranking-positive-iou "$CANDIDATE_RANKING_POSITIVE_IOU" \
+    --candidate-ranking-other-iou "$CANDIDATE_RANKING_OTHER_IOU" \
+    --rollout-identity-switch-penalty "$ROLLOUT_IDENTITY_SWITCH_PENALTY" \
+    --rollout-window-miss-penalty "$ROLLOUT_WINDOW_MISS_PENALTY" \
+    --rollout-validation-mode "$ROLLOUT_VALIDATION_MODE" \
     --geometry-only-epochs "$GEOMETRY_ONLY_EPOCHS" \
     --hard-negative-start-epoch "$HARD_NEGATIVE_START_EPOCH" \
     --reid-start-epoch "$REID_START_EPOCH" \
@@ -398,6 +470,7 @@ python programs/train_lorat_v9_local_search_head.py \
     --v9-local-grid-size "$LOCAL_GRID_SIZE" \
     --training-memory-slots "$TRAINING_MEMORY_SLOTS" \
     --checkpoint-interval "$CHECKPOINT_INTERVAL" \
+    --checkpoint-retention "$CHECKPOINT_RETENTION" \
     --checkpoint-dir "$CHECKPOINT_DIR" \
     --diagnostic-csv "$RESULT_ROOT/logs/train_${CONFIG_SAFE}_diagnostics.csv" \
     --output "$OUTPUT" \
