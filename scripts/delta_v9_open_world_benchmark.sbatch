@@ -6,7 +6,7 @@
 
 #SBATCH --job-name=lorat-v9-ow
 #SBATCH --account=CHANGE_ME_DELTA_ACCOUNT
-#SBATCH --partition=gpuA100x4
+#SBATCH --partition=gpuA40x4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

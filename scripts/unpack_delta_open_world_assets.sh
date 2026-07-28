@@ -121,4 +121,4 @@ printf '  LaSOT: '; find "$DATA_ROOT/LaSOT_subset" -maxdepth 2 -type d 2>/dev/nu
 echo ""
 echo "Submit the open-world benchmark with your real Delta account, for example:"
 echo "  cd $DELTA_ROOT"
-echo "  sbatch --account=<your_delta_account> --partition=gpuA100x4 delta_v9_open_world_benchmark.sbatch"
+echo "  sbatch --account=<your_delta_account> --partition=gpuA40x4 delta_v9_open_world_benchmark.sbatch"

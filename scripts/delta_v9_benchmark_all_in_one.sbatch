@@ -8,13 +8,14 @@
 #        sbatch --account=<your_delta_account> scripts/delta_v9_benchmark_all_in_one.sbatch
 #   3. Keep datasets under DATA_ROOT and V9 heads under HEAD_WEIGHTS_ROOT.
 #
-# Delta account and partition names depend on your allocation. The common GPU
-# partitions include gpuA100x4, gpuA100x8, gpuA40x4, gpuMI100x8, and newer H200
-# partitions on some allocations.
+# Delta account and partition names depend on your allocation. We currently
+# target the A40 GPU nodes because that is the recommended queue for this work.
+# The common GPU partitions include gpuA40x4, gpuA100x4, gpuA100x8, gpuMI100x8,
+# and newer H200 partitions on some allocations.
 
 #SBATCH --job-name=lorat-v9-delta-bench
 #SBATCH --account=CHANGE_ME_DELTA_ACCOUNT
-#SBATCH --partition=gpuA100x4
+#SBATCH --partition=gpuA40x4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
